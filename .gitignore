@@ -1,6 +1,6 @@
 /target/
+artifacts/
 /.env
 /data/
 /logs/
 *.profraw
-
