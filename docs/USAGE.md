@@ -24,6 +24,7 @@ Important settings:
 - `ADMIN_API_KEY`, `ESCALATION_API_KEY`, `PUBLIC_BLOCKLIST_API_KEY`, `JWT_SECRET`: API-key and JWT protection for mutation routes.
 - `WEBHOOK_SHARED_SECRET`: HMAC secret for AI service webhooks.
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
+- `MODEL_URI=mcp://primary/classify` plus `MCP_SERVER_PRIMARY_URL`, `MCP_SERVER_PRIMARY_AUTH_TOKEN`, and `MCP_SERVER_PRIMARY_TIMEOUT`: optional MCP model proxying compatible with `request-guard-mcp`. Leave `MODEL_URI` unset to keep MCP disabled.
 - `PAYMENT_GATEWAY_URL`, `PAYMENT_PROVIDER`, `PAYMENT_API_KEY`: optional payment gateway forwarding for pay-per-crawl flows.
 - `ADMIN_UI_SSO_ENABLED`, `ADMIN_UI_SSO_MODE`, `ADMIN_UI_OIDC_*`, `ADMIN_UI_SAML_*`: admin SSO configuration.
 - `EDGE_ALLOWED_DOMAINS`, `REAL_BACKEND_HOST`, `RULES_URL`, `CDN_PURGE_URL`: edge operations configuration.

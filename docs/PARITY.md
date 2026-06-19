@@ -11,7 +11,7 @@ runtime services.
 | `src/admin_ui/admin_ui.py` | `services/admin-ui` | Core admin routes plus persisted passkey/WebAuthn challenge, credential, MFA, backup-code, logout/session flows, metrics, operations triggers, Redis blocklist management, API-key/JWT mutation auth, and PostgreSQL event log reads are implemented. |
 | `src/captcha/*` | `services/captcha-service` | Challenge, solve, and verify endpoints implemented with a local token baseline. |
 | `src/cloud_dashboard/cloud_dashboard_api.py` | `services/cloud-dashboard` | Register, push metrics, fetch metrics, and websocket handshake implemented. |
-| `cloud-proxy/main.py` | `services/cloud-proxy` | `/health` and `/api/chat` endpoint shape implemented; forwards through a provider-adapter crate to `CLOUD_MODEL_API_URL` when configured, and reports `not_configured` when no upstream is set. |
+| `cloud-proxy/main.py` | `services/cloud-proxy` | `/health` and `/api/chat` endpoint shape implemented; forwards through a provider-adapter crate to `CLOUD_MODEL_API_URL` when configured, supports optional `MODEL_URI=mcp://primary/classify` WebSocket MCP forwarding for `request-guard-mcp`, and reports `not_configured` when no upstream is set. |
 | `prompt-router/main.py` | `services/prompt-router` | `/health` and `/route` endpoint shape implemented with token-based routing and cloud-proxy forwarding. |
 | `src/config_recommender/recommender_api.py` | `services/config-recommender` | `/recommendations` implemented with baseline recommendations. |
 | `src/public_blocklist/public_blocklist_api.py` | `services/public-blocklist` | `/list`, `/list/auth`, and `/report` implemented with Redis-backed state and in-memory fallback. |
@@ -29,8 +29,9 @@ runtime services.
   should use explicit trait-based extension crates or sidecars.
 - Provider SDKs are represented by a typed HTTP adapter layer for generic HTTP,
   OpenAI-compatible, Anthropic-compatible, Cohere-compatible,
-  Gemini-compatible, Mistral-compatible, Ollama-compatible, and local HTTP
-  upstreams.
+  Gemini-compatible, Mistral-compatible, Ollama-compatible, local HTTP, and
+  explicitly configured MCP upstreams. Third-party MCP servers are optional and
+  are not contacted unless `MODEL_URI` or `MODEL_PROVIDER=mcp` is set.
 - WebAuthn/passkey/MFA routes now persist challenges, credentials, TOTP
   secrets, backup-code hashes, and sessions. Full FIDO2 attestation and
   signature verification can be layered onto the stored credential model.
