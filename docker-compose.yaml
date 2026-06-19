@@ -1,0 +1,209 @@
+services:
+  escalation-engine:
+    build: .
+    command: ["/usr/local/bin/escalation-engine"]
+    environment:
+      ESCALATION_ENGINE_PORT: "8002"
+      ESCALATION_THRESHOLD: "0.70"
+      ESCALATION_THROTTLE_THRESHOLD: "0.72"
+      ESCALATION_TARPIT_THRESHOLD: "0.82"
+      ESCALATION_BLOCK_THRESHOLD: "0.92"
+      REDIS_HOST: redis
+      REDIS_DB_FREQUENCY: "0"
+      REDIS_DB_BLOCKLIST: "0"
+      RUST_LOG: info
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+    ports:
+      - "8002:8002"
+
+  ai-service:
+    build: .
+    command: ["/usr/local/bin/ai-service"]
+    environment:
+      AI_SERVICE_PORT: "8001"
+      WEBHOOK_SHARED_SECRET: "${WEBHOOK_SHARED_SECRET:-dev-secret}"
+      REDIS_HOST: redis
+      REDIS_DB_BLOCKLIST: "0"
+      RUST_LOG: info
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+    ports:
+      - "8001:8001"
+
+  tarpit-api:
+    build: .
+    command: ["/usr/local/bin/tarpit-api"]
+    environment:
+      TARPIT_API_PORT: "8003"
+      RUST_LOG: info
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+    ports:
+      - "8003:8003"
+
+  admin-ui:
+    build: .
+    command: ["/usr/local/bin/admin-ui"]
+    environment:
+      ADMIN_UI_PORT: "8004"
+      REDIS_HOST: redis
+      REDIS_DB_BLOCKLIST: "0"
+      RUST_LOG: info
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+      ADMIN_UI_SSO_ENABLED: "${ADMIN_UI_SSO_ENABLED:-false}"
+      ADMIN_UI_SSO_MODE: "${ADMIN_UI_SSO_MODE:-oidc}"
+      ADMIN_UI_OIDC_JWT_SECRET: "${ADMIN_UI_OIDC_JWT_SECRET:-}"
+    ports:
+      - "8004:8004"
+
+  captcha-service:
+    build: .
+    command: ["/usr/local/bin/captcha-service"]
+    environment:
+      CAPTCHA_SERVICE_PORT: "8005"
+      RUST_LOG: info
+    ports:
+      - "8005:8005"
+
+  cloud-dashboard:
+    build: .
+    command: ["/usr/local/bin/cloud-dashboard"]
+    environment:
+      CLOUD_DASHBOARD_PORT: "8006"
+      RUST_LOG: info
+    ports:
+      - "8006:8006"
+
+  config-recommender:
+    build: .
+    command: ["/usr/local/bin/config-recommender"]
+    environment:
+      CONFIG_RECOMMENDER_PORT: "8007"
+      RUST_LOG: info
+    ports:
+      - "8007:8007"
+
+  cloud-proxy:
+    build: .
+    command: ["/usr/local/bin/cloud-proxy"]
+    environment:
+      CLOUD_PROXY_PORT: "8008"
+      CLOUD_MODEL_API_URL: "${CLOUD_MODEL_API_URL:-}"
+      CLOUD_MODEL_API_KEY: "${CLOUD_MODEL_API_KEY:-}"
+      MODEL_PROVIDER: "${MODEL_PROVIDER:-generic-http}"
+      MODEL_NAME: "${MODEL_NAME:-default}"
+      ANTHROPIC_VERSION: "${ANTHROPIC_VERSION:-2023-06-01}"
+      RUST_LOG: info
+    ports:
+      - "8008:8008"
+
+  prompt-router:
+    build: .
+    command: ["/usr/local/bin/prompt-router"]
+    environment:
+      PROMPT_ROUTER_PORT: "8009"
+      CLOUD_PROXY_URL: "http://cloud-proxy:8008/api/chat"
+      LOCAL_MODEL_TARGET: "${LOCAL_MODEL_TARGET:-local-inference}"
+      MAX_LOCAL_TOKENS: "2048"
+      RUST_LOG: info
+    ports:
+      - "8009:8009"
+
+  public-blocklist:
+    build: .
+    command: ["/usr/local/bin/public-blocklist"]
+    environment:
+      PUBLIC_BLOCKLIST_PORT: "8011"
+      REDIS_HOST: redis
+      REDIS_DB_BLOCKLIST: "0"
+      RUST_LOG: info
+    ports:
+      - "8011:8011"
+
+  pay-per-crawl:
+    build: .
+    command: ["/usr/local/bin/pay-per-crawl"]
+    environment:
+      PAY_PER_CRAWL_PORT: "8012"
+      PAYMENT_GATEWAY_URL: "${PAYMENT_GATEWAY_URL:-}"
+      PAYMENT_PROVIDER: "${PAYMENT_PROVIDER:-generic-http}"
+      PAYMENT_API_KEY: "${PAYMENT_API_KEY:-}"
+      PAYMENT_CURRENCY: "${PAYMENT_CURRENCY:-usd}"
+      PAY_PER_CRAWL_DEFAULT_CHARGE: "${PAY_PER_CRAWL_DEFAULT_CHARGE:-0.01}"
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+      RUST_LOG: info
+    ports:
+      - "8012:8012"
+
+  edge-ops:
+    build: .
+    command: ["/usr/local/bin/edge-ops"]
+    environment:
+      EDGE_OPS_PORT: "8013"
+      REDIS_HOST: redis
+      REDIS_DB_BLOCKLIST: "0"
+      REAL_BACKEND_HOST: "${REAL_BACKEND_HOST:-https://example.com}"
+      RULES_URL: "${RULES_URL:-}"
+      EDGE_ALLOWED_DOMAINS: "${EDGE_ALLOWED_DOMAINS:-}"
+      CDN_PURGE_URL: "${CDN_PURGE_URL:-}"
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+      RUST_LOG: info
+    ports:
+      - "8013:8013"
+
+  rag-trainer:
+    build: .
+    command: ["/usr/local/bin/rag-trainer"]
+    environment:
+      RAG_TRAINER_PORT: "8014"
+      POSTGRES_ENABLED: "true"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DBNAME: markovdb
+      PG_USER: markovuser
+      PG_PASSWORD: markovpass
+      RUST_LOG: info
+    ports:
+      - "8014:8014"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: markovuser
+      POSTGRES_PASSWORD: markovpass
+      POSTGRES_DB: markovdb
+    ports:
+      - "5432:5432"

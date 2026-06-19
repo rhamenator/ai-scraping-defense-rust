@@ -1,0 +1,34 @@
+image:
+  repository: your-registry/ai-scraping-defense-rust
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+env:
+  RUST_LOG: info
+  REDIS_HOST: redis
+  PG_HOST: postgres
+  PG_PORT: "5432"
+  PG_DBNAME: markovdb
+  PG_USER: markovuser
+
+services:
+  admin-ui:
+    command: /usr/local/bin/admin-ui
+    port: 8004
+  escalation-engine:
+    command: /usr/local/bin/escalation-engine
+    port: 8002
+  ai-service:
+    command: /usr/local/bin/ai-service
+    port: 8001
+  tarpit-api:
+    command: /usr/local/bin/tarpit-api
+    port: 8003
+  edge-ops:
+    command: /usr/local/bin/edge-ops
+    port: 8013
+  rag-trainer:
+    command: /usr/local/bin/rag-trainer
+    port: 8014

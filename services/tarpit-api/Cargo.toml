@@ -1,0 +1,14 @@
+[package]
+name = "tarpit-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+asd-core = { path = "../../crates/asd-core" }
+asd-tarpit = { path = "../../crates/asd-tarpit" }
+axum.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

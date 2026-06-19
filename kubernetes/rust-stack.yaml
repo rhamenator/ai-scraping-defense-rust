@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-scraping-defense-rust-config
+data:
+  RUST_LOG: info
+  REDIS_HOST: redis
+  PG_HOST: postgres
+  PG_PORT: "5432"
+  PG_DBNAME: markovdb
+  PG_USER: markovuser
+  MODEL_PROVIDER: generic-http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-ops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-ops
+  template:
+    metadata:
+      labels:
+        app: edge-ops
+    spec:
+      containers:
+        - name: edge-ops
+          image: your-registry/ai-scraping-defense-rust:latest
+          command: ["/usr/local/bin/edge-ops"]
+          envFrom:
+            - configMapRef:
+                name: ai-scraping-defense-rust-config
+          env:
+            - name: EDGE_OPS_PORT
+              value: "8013"
+          ports:
+            - containerPort: 8013
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-ops
+spec:
+  selector:
+    app: edge-ops
+  ports:
+    - port: 8013
+      targetPort: 8013
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-trainer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-trainer
+  template:
+    metadata:
+      labels:
+        app: rag-trainer
+    spec:
+      containers:
+        - name: rag-trainer
+          image: your-registry/ai-scraping-defense-rust:latest
+          command: ["/usr/local/bin/rag-trainer"]
+          envFrom:
+            - configMapRef:
+                name: ai-scraping-defense-rust-config
+          env:
+            - name: RAG_TRAINER_PORT
+              value: "8014"
+          ports:
+            - containerPort: 8014
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-trainer
+spec:
+  selector:
+    app: rag-trainer
+  ports:
+    - port: 8014
+      targetPort: 8014

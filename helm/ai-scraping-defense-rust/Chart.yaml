@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ai-scraping-defense-rust
+description: Rust service stack for AI Scraping Defense
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
