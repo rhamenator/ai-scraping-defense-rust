@@ -158,6 +158,15 @@ helm install asd-rust helm/ai-scraping-defense-rust
 
 The Kubernetes and Helm files are starter artifacts. Tune image names, secrets, ingress, resource requests, and persistence for your cluster.
 
+## Release Artifacts
+
+Release automation runs on tags matching `v*.*.*`:
+
+- `.github/workflows/release-images.yml` publishes `ghcr.io/rhamenator/ai-scraping-defense-rust`.
+- `.github/workflows/release-binaries.yml` builds a Linux x64 tarball containing all service binaries and matching SHA-256 checksums.
+
+Stable semver tags such as `v1.2.3` publish `1.2.3`, `1.2`, and `latest` image tags. Prerelease tags such as `v1.2.3-rc.1` publish only the prerelease version tag and GitHub prerelease assets.
+
 ## Verification
 
 ```powershell

@@ -55,6 +55,15 @@ Run a health smoke check against the default ports:
 
 Detailed setup, configuration, API examples, Docker, and Kubernetes usage are in [docs/USAGE.md](docs/USAGE.md).
 
+## Release Artifacts
+
+Tagged releases publish:
+
+- `ghcr.io/rhamenator/ai-scraping-defense-rust` container images for the full multi-service runtime image.
+- Linux x64 release bundles containing all service binaries plus checksums.
+
+Push a tag such as `v1.0.0` to publish a stable image with version, minor, and `latest` tags. Prerelease tags such as `v1.0.0-rc.1` publish prerelease image and binary assets without moving `latest`.
+
 ## Verification
 
 ```powershell

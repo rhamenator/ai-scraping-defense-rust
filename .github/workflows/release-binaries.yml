@@ -1,0 +1,82 @@
+name: release-binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - name: Build release binaries
+        run: cargo build --release --workspace --locked
+
+      - name: Package service binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-manual}"
+          prefix="ai-scraping-defense-rust-${version}-linux-x64"
+          stage="artifacts/${prefix}"
+          mkdir -p "${stage}"
+
+          services=(
+            admin-ui
+            ai-service
+            captcha-service
+            cloud-dashboard
+            cloud-proxy
+            config-recommender
+            edge-ops
+            escalation-engine
+            pay-per-crawl
+            prompt-router
+            public-blocklist
+            rag-trainer
+            tarpit-api
+          )
+
+          for service in "${services[@]}"; do
+            install -m 0755 "target/release/${service}" "${stage}/${service}"
+          done
+
+          cp README.md "${stage}/README.md"
+          cp docs/USAGE.md "${stage}/USAGE.md"
+          tar -C artifacts -czf "artifacts/${prefix}.tar.gz" "${prefix}"
+          (cd artifacts && sha256sum "${prefix}.tar.gz" > "${prefix}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-scraping-defense-rust-linux-x64
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+
+      - name: Publish release assets
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Summarize binaries
+        shell: bash
+        run: |
+          {
+            echo "Built release bundle:"
+            for artifact in artifacts/*.tar.gz artifacts/*.sha256; do
+              echo "- \`$(basename "$artifact")\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
