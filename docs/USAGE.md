@@ -28,6 +28,9 @@ Important settings:
 - `PAYMENT_GATEWAY_URL`, `PAYMENT_PROVIDER`, `PAYMENT_API_KEY`: optional payment gateway forwarding for pay-per-crawl flows.
 - `ADMIN_UI_SSO_ENABLED`, `ADMIN_UI_SSO_MODE`, `ADMIN_UI_OIDC_*`, `ADMIN_UI_SAML_*`: admin SSO configuration.
 - `EDGE_ALLOWED_DOMAINS`, `REAL_BACKEND_HOST`, `RULES_URL`, `CDN_PURGE_URL`: edge operations configuration.
+- `ENABLE_GLOBAL_CDN`, `CLOUD_CDN_PROVIDER`, and `SECURITY_CDN_TRUSTED_PROXY_CIDRS`: optional Cloudflare ingress integration. Configure Cloudflare's published proxy ranges so originating client IPs—not Cloudflare edge addresses—are evaluated and blocked.
+
+Cloudflare is treated as an ingress/CDN boundary, not as a general outbound proxy. Ordinary model, payment, rules, and backend requests continue directly to their configured destinations, avoiding unnecessary Cloudflare traffic charges. When Cloudflare integration is enabled and the request/bot thresholds are exceeded, `config-recommender` returns an advisory to consider Under Attack Mode; it never changes the Cloudflare account automatically.
 
 Each service also accepts a `*_PORT` variable matching its package name in uppercase, for example `ESCALATION_ENGINE_PORT` or `RAG_TRAINER_PORT`.
 
@@ -109,8 +112,19 @@ Register a pay-per-crawl client:
 ```powershell
 Invoke-RestMethod -Method Post `
   -Uri http://127.0.0.1:8012/register-crawler `
+  -Headers @{"x-api-key"=$env:PAY_PER_CRAWL_API_KEY} `
   -ContentType application/json `
-  -Body '{"name":"ExampleCrawler","token":"crawler-token","purpose":"licensed indexing","credit":10.0}'
+  -Body '{"name":"ExampleCrawler","token":"crawler-token","purpose":"licensed indexing"}'
+
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8012/pay `
+  -Headers @{"x-api-key"=$env:PAY_PER_CRAWL_API_KEY} `
+  -ContentType application/json `
+  -Body '{"token":"crawler-token","amount":10.0}'
+
+Invoke-WebRequest `
+  -Uri http://127.0.0.1:8012/proxy/licensed-page `
+  -Headers @{"x-crawler-token"="crawler-token"}
 ```
 
 Export fine-tuning JSONL:

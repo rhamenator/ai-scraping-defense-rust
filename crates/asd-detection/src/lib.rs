@@ -1,7 +1,14 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::RwLock;
 
 const KNOWN_BAD_UAS: &[&str] = &[
@@ -33,6 +40,8 @@ pub struct RequestMetadata {
     pub headers: Option<HashMap<String, String>>,
     pub fingerprint_id: Option<String>,
     pub fingerprint_reuse_count: Option<u64>,
+    /// Set only after forward-confirmed reverse DNS or equivalent provider verification.
+    pub verified_bot: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -110,9 +119,10 @@ pub fn extract_features(metadata: &RequestMetadata, freq: FrequencyFeatures) -> 
         path_disallowed: u8::from(is_disallowed_path(path)),
         ua_is_known_bad: u8::from(KNOWN_BAD_UAS.iter().any(|needle| ua_lower.contains(needle))),
         ua_is_known_benign_crawler: u8::from(
-            KNOWN_BENIGN_CRAWLERS
-                .iter()
-                .any(|needle| ua_lower.contains(needle)),
+            metadata.verified_bot.unwrap_or(false)
+                && KNOWN_BENIGN_CRAWLERS
+                    .iter()
+                    .any(|needle| ua_lower.contains(needle)),
         ),
         ua_is_empty: u8::from(ua.is_empty()),
         ua_library_is_bot: u8::from(ua_lower.contains("bot") || ua_lower.contains("crawler")),
@@ -209,18 +219,25 @@ pub fn decide(
 fn is_disallowed_path(path: &str) -> bool {
     ["/admin", "/internal", "/.env", "/wp-admin", "/xmlrpc.php"]
         .iter()
-        .any(|prefix| path.starts_with(prefix))
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 #[derive(Clone, Default)]
 pub struct InMemoryFrequency {
     inner: Arc<RwLock<HashMap<String, Vec<std::time::Instant>>>>,
+    operations: Arc<AtomicU64>,
 }
 
 impl InMemoryFrequency {
     pub async fn record(&self, key: &str, window: Duration) -> FrequencyFeatures {
         let now = std::time::Instant::now();
         let mut guard = self.inner.write().await;
+        if self.operations.fetch_add(1, Ordering::Relaxed) % 1024 == 0 {
+            guard.retain(|_, seen| {
+                seen.retain(|entry| now.duration_since(*entry) <= window);
+                !seen.is_empty()
+            });
+        }
         let entries = guard.entry(key.to_string()).or_default();
         entries.retain(|seen| now.duration_since(*seen) <= window);
         let previous = entries.last().copied();
@@ -258,5 +275,35 @@ mod tests {
         );
         assert!(decision.is_bot);
         assert!(decision.score > 0.7);
+    }
+
+    #[test]
+    fn claimed_googlebot_is_not_trusted_without_verification() {
+        let unverified = extract_features(
+            &RequestMetadata {
+                user_agent: Some("Googlebot/2.1".into()),
+                verified_bot: Some(false),
+                ..Default::default()
+            },
+            FrequencyFeatures::default(),
+        );
+        let verified = extract_features(
+            &RequestMetadata {
+                user_agent: Some("Googlebot/2.1".into()),
+                verified_bot: Some(true),
+                ..Default::default()
+            },
+            FrequencyFeatures::default(),
+        );
+
+        assert_eq!(unverified.ua_is_known_benign_crawler, 0);
+        assert_eq!(verified.ua_is_known_benign_crawler, 1);
+    }
+
+    #[test]
+    fn disallowed_path_matching_respects_segment_boundaries() {
+        assert!(is_disallowed_path("/admin"));
+        assert!(is_disallowed_path("/admin/users"));
+        assert!(!is_disallowed_path("/administrator"));
     }
 }

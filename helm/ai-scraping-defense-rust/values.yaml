@@ -12,6 +12,12 @@ env:
   PG_PORT: "5432"
   PG_DBNAME: markovdb
   PG_USER: markovuser
+  ENABLE_GLOBAL_CDN: "false"
+  CLOUD_CDN_PROVIDER: cloudflare
+  SECURITY_CDN_TRUSTED_PROXY_CIDRS: ""
+  SECURITY_TRUSTED_PROXY_CIDRS: ""
+  CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_REQUESTS: "100"
+  CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_BOT_RATIO: "0.25"
 
 services:
   admin-ui:
@@ -23,9 +29,30 @@ services:
   ai-service:
     command: /usr/local/bin/ai-service
     port: 8001
+  config-recommender:
+    command: /usr/local/bin/config-recommender
+    port: 8007
   tarpit-api:
     command: /usr/local/bin/tarpit-api
     port: 8003
+  captcha-service:
+    command: /usr/local/bin/captcha-service
+    port: 8005
+  cloud-dashboard:
+    command: /usr/local/bin/cloud-dashboard
+    port: 8006
+  cloud-proxy:
+    command: /usr/local/bin/cloud-proxy
+    port: 8008
+  prompt-router:
+    command: /usr/local/bin/prompt-router
+    port: 8009
+  public-blocklist:
+    command: /usr/local/bin/public-blocklist
+    port: 8011
+  pay-per-crawl:
+    command: /usr/local/bin/pay-per-crawl
+    port: 8012
   edge-ops:
     command: /usr/local/bin/edge-ops
     port: 8013

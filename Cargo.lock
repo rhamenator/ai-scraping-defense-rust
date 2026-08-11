@@ -366,6 +366,7 @@ dependencies = [
  "anyhow",
  "asd-core",
  "axum",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -1101,6 +1102,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-postgres",
+ "tracing",
  "uuid",
 ]
 
@@ -1304,6 +1306,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]

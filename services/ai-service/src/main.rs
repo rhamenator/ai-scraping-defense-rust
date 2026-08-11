@@ -65,7 +65,12 @@ async fn webhook(
     };
     match action.action.as_str() {
         "block_ip" => {
-            state.blocklist.block(ip.to_string()).await;
+            if !state.blocklist.block(ip.to_string()).await {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "IP is invalid or belongs to trusted proxy infrastructure",
+                ));
+            }
             record_security_event(
                 state.pg.as_deref(),
                 "webhook_block_ip",

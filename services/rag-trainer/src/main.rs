@@ -2,6 +2,7 @@ use asd_core::{health, observability_router, pg_connect_from_env, serve, Service
 use asd_detection::{decide, FrequencyFeatures, RequestMetadata};
 use axum::{
     extract::State,
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -46,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let state = TrainerState {
         pg: pg_connect_from_env().await.map(Arc::new),
     };
-    ensure_training_table(state.pg.as_deref()).await;
+    ensure_training_table(state.pg.as_deref()).await?;
     let app = Router::new()
         .route("/health", get(|| async { health("rag-trainer").await }))
         .route("/training/label", post(label_records))
@@ -67,11 +68,11 @@ async fn label_records(Json(payload): Json<BatchRequest>) -> Json<serde_json::Va
 async fn ingest_records(
     State(state): State<TrainerState>,
     Json(payload): Json<BatchRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let labeled = label_batch(payload.records);
     if let Some(pg) = state.pg.as_deref() {
         for record in &labeled {
-            let _ = pg
+            pg
                 .execute(
                     "INSERT INTO training_requests
                      (ip, method, path, status, bytes, referer, user_agent, bot_score, label, reasons)
@@ -89,10 +90,17 @@ async fn ingest_records(
                         &json!(record.reasons),
                     ],
                 )
-                .await;
+                .await
+                .map_err(|exc| {
+                    tracing::error!(error = %exc, "failed to persist training record");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"status":"error","message":"training database unavailable"})),
+                    )
+                })?;
         }
     }
-    Json(json!({"status":"success","count":labeled.len()}))
+    Ok(Json(json!({"status":"success","count":labeled.len()})))
 }
 
 async fn export_jsonl(Json(payload): Json<BatchRequest>) -> Json<serde_json::Value> {
@@ -156,13 +164,12 @@ fn label_batch(records: Vec<LogRecord>) -> Vec<LabeledRecord> {
         .collect()
 }
 
-async fn ensure_training_table(pg: Option<&tokio_postgres::Client>) {
+async fn ensure_training_table(pg: Option<&tokio_postgres::Client>) -> anyhow::Result<()> {
     let Some(pg) = pg else {
-        return;
+        return Ok(());
     };
-    let _ = pg
-        .execute(
-            "CREATE TABLE IF NOT EXISTS training_requests (
+    pg.execute(
+        "CREATE TABLE IF NOT EXISTS training_requests (
                 id BIGSERIAL PRIMARY KEY,
                 ip TEXT NOT NULL,
                 method TEXT,
@@ -176,7 +183,8 @@ async fn ensure_training_table(pg: Option<&tokio_postgres::Client>) {
                 reasons JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
-            &[],
-        )
-        .await;
+        &[],
+    )
+    .await?;
+    Ok(())
 }

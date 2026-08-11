@@ -81,7 +81,15 @@ impl ModelProvider {
         }
 
         let payload = self.normalize_payload(request);
-        let client = reqwest::Client::new();
+        let timeout_seconds = std::env::var("MODEL_PROVIDER_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(timeout_seconds))
+            .build()?;
         let mut outbound = client.post(&self.endpoint).json(&payload);
         if let Some(api_key) = &self.api_key {
             outbound = match self.kind {
@@ -93,12 +101,32 @@ impl ModelProvider {
                 _ => outbound.bearer_auth(api_key),
             };
         }
-        let response = outbound.send().await?;
+        let mut response = outbound.send().await?;
         let status = response.status();
-        let body = response
-            .json::<serde_json::Value>()
-            .await
-            .unwrap_or_else(|_| json!({}));
+        let maximum_bytes = std::env::var("MODEL_PROVIDER_MAX_RESPONSE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+        if response
+            .content_length()
+            .is_some_and(|length| length as usize > maximum_bytes)
+        {
+            anyhow::bail!("model provider response exceeds configured limit");
+        }
+        let mut response_bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if response_bytes.len().saturating_add(chunk.len()) > maximum_bytes {
+                anyhow::bail!("model provider response exceeds configured limit");
+            }
+            response_bytes.extend_from_slice(&chunk);
+        }
+        let body =
+            serde_json::from_slice::<serde_json::Value>(&response_bytes).unwrap_or_else(|_| {
+                json!({
+                    "text": String::from_utf8_lossy(&response_bytes),
+                    "parse_error": "upstream response was not JSON"
+                })
+            });
         Ok(json!({
             "status": if status.is_success() { "success" } else { "error" },
             "provider": self.kind.name(),

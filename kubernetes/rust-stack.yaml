@@ -10,6 +10,50 @@ data:
   PG_DBNAME: markovdb
   PG_USER: markovuser
   MODEL_PROVIDER: generic-http
+  ENABLE_GLOBAL_CDN: "false"
+  CLOUD_CDN_PROVIDER: cloudflare
+  SECURITY_CDN_TRUSTED_PROXY_CIDRS: ""
+  SECURITY_TRUSTED_PROXY_CIDRS: ""
+  CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_REQUESTS: "100"
+  CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_BOT_RATIO: "0.25"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-recommender
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: config-recommender
+  template:
+    metadata:
+      labels:
+        app: config-recommender
+    spec:
+      containers:
+        - name: config-recommender
+          image: your-registry/ai-scraping-defense-rust:latest
+          command: ["/usr/local/bin/config-recommender"]
+          envFrom:
+            - configMapRef:
+                name: ai-scraping-defense-rust-config
+          env:
+            - name: CONFIG_RECOMMENDER_PORT
+              value: "8007"
+          ports:
+            - containerPort: 8007
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-recommender
+spec:
+  selector:
+    app: config-recommender
+  ports:
+    - port: 8007
+      targetPort: 8007
 ---
 apiVersion: apps/v1
 kind: Deployment

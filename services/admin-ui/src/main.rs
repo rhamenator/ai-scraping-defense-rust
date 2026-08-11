@@ -4,9 +4,10 @@ use asd_core::{
     IpAction, ServiceConfig,
 };
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
-    response::Html,
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -34,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         blocklist: BlocklistState::from_env().await,
         pg: pg_connect_from_env().await.map(Arc::new),
     };
-    ensure_admin_auth_tables(state.pg.as_deref()).await;
+    ensure_admin_auth_tables(state.pg.as_deref()).await?;
     let app = Router::new()
         .route("/health", get(|| async { health("admin-ui").await }))
         .route("/", get(index))
@@ -69,8 +70,28 @@ async fn main() -> anyhow::Result<()> {
         .route("/operations/rules-fetch", post(operation_rules_fetch))
         .route("/operations/robots-fetch", post(operation_robots_fetch))
         .merge(observability_router("admin-ui"))
+        .layer(middleware::from_fn(require_admin_middleware))
         .with_state(state);
     serve(app, config).await
+}
+
+async fn require_admin_middleware(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let public_path = matches!(
+        path,
+        "/" | "/health"
+            | "/sso/user"
+            | "/sso/validate"
+            | "/mfa/totp/verify"
+            | "/mfa/backup-codes/verify"
+            | "/passkey/login"
+            | "/webauthn/login/begin"
+            | "/webauthn/login/complete"
+    );
+    if !public_path && !is_authorized(request.headers(), "ADMIN_API_KEY", "JWT_SECRET") {
+        return unauthorized().into_response();
+    }
+    next.run(request).await
 }
 
 async fn index() -> Html<&'static str> {
@@ -183,7 +204,11 @@ async fn block(
         return Err(unauthorized());
     }
     if let Some(ip) = action.ip {
-        state.blocklist.block(ip.clone()).await;
+        if !state.blocklist.block(ip.clone()).await {
+            return Err(bad_request(
+                "IP is invalid or belongs to trusted proxy infrastructure",
+            ));
+        }
         record_security_event(
             state.pg.as_deref(),
             "admin_block_ip",
@@ -257,139 +282,64 @@ struct UserRequest {
 }
 
 #[derive(Deserialize)]
-struct CredentialRequest {
-    user: Option<String>,
-    challenge: Option<String>,
-    credential_id: Option<String>,
-    public_key: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
 struct TotpVerifyRequest {
     user: Option<String>,
     code: String,
 }
 
 async fn passkey_register(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    payload: Option<Json<CredentialRequest>>,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    _payload: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !is_authorized(&headers, "ADMIN_API_KEY", "JWT_SECRET") {
-        return Err(unauthorized());
-    }
-    let payload = payload
-        .map(|Json(payload)| payload)
-        .unwrap_or(CredentialRequest {
-            user: None,
-            challenge: None,
-            credential_id: None,
-            public_key: None,
-        });
-    let user = admin_user(payload.user);
-    let credential_id = payload.credential_id.unwrap_or_else(|| random_token(16));
-    let public_key = payload
-        .public_key
-        .unwrap_or_else(|| json!({"kind":"passkey"}));
-    store_credential(state.pg.as_deref(), &user, &credential_id, public_key).await?;
-    record_security_event(
-        state.pg.as_deref(),
-        "admin_passkey_registered",
-        &user,
-        json!({"credential_id":credential_id}),
-    )
-    .await;
-    Ok(Json(json!({
-        "status":"registered",
-        "credential_id": credential_id,
-        "user": user
-    })))
+    Err(passkeys_unavailable())
 }
 
 async fn passkey_login(
-    State(state): State<AppState>,
-    payload: Option<Json<CredentialRequest>>,
+    State(_state): State<AppState>,
+    _payload: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let payload = payload
-        .map(|Json(payload)| payload)
-        .unwrap_or(CredentialRequest {
-            user: None,
-            challenge: None,
-            credential_id: None,
-            public_key: None,
-        });
-    let user = admin_user(payload.user);
-    let credential_id = payload.credential_id.unwrap_or_default();
-    if credential_id.is_empty()
-        || !credential_exists(state.pg.as_deref(), &user, &credential_id).await?
-    {
-        return Err(bad_request("known credential_id required"));
-    }
-    let token = issue_session(state.pg.as_deref(), &user).await?;
-    Ok(Json(json!({"status":"success","token":token,"user":user})))
+    Err(passkeys_unavailable())
 }
 
 async fn webauthn_register_begin(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    payload: Option<Json<UserRequest>>,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    _payload: Option<Json<UserRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !is_authorized(&headers, "ADMIN_API_KEY", "JWT_SECRET") {
-        return Err(unauthorized());
-    }
-    issue_challenge(state.pg.as_deref(), payload, "register").await
+    Err(passkeys_unavailable())
 }
 
 async fn webauthn_login_begin(
-    State(state): State<AppState>,
-    payload: Option<Json<UserRequest>>,
+    State(_state): State<AppState>,
+    _payload: Option<Json<UserRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    issue_challenge(state.pg.as_deref(), payload, "login").await
+    Err(passkeys_unavailable())
 }
 
 async fn webauthn_register_complete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<CredentialRequest>,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    Json(_payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !is_authorized(&headers, "ADMIN_API_KEY", "JWT_SECRET") {
-        return Err(unauthorized());
-    }
-    let user = admin_user(payload.user);
-    let challenge = payload.challenge.unwrap_or_default();
-    if !consume_challenge(state.pg.as_deref(), &user, "register", &challenge).await? {
-        return Err(bad_request("valid registration challenge required"));
-    }
-    let credential_id = payload.credential_id.unwrap_or_else(|| random_token(16));
-    let public_key = payload.public_key.unwrap_or_else(|| json!({}));
-    store_credential(state.pg.as_deref(), &user, &credential_id, public_key).await?;
-    record_security_event(
-        state.pg.as_deref(),
-        "admin_webauthn_registered",
-        &user,
-        json!({"credential_id":credential_id}),
-    )
-    .await;
-    Ok(Json(
-        json!({"status":"registered","credential_id":credential_id}),
-    ))
+    Err(passkeys_unavailable())
 }
 
 async fn webauthn_login_complete(
-    State(state): State<AppState>,
-    Json(payload): Json<CredentialRequest>,
+    State(_state): State<AppState>,
+    Json(_payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let user = admin_user(payload.user);
-    let challenge = payload.challenge.unwrap_or_default();
-    let credential_id = payload.credential_id.unwrap_or_default();
-    if !consume_challenge(state.pg.as_deref(), &user, "login", &challenge).await? {
-        return Err(bad_request("valid login challenge required"));
-    }
-    if !credential_exists(state.pg.as_deref(), &user, &credential_id).await? {
-        return Err(bad_request("known credential_id required"));
-    }
-    let token = issue_session(state.pg.as_deref(), &user).await?;
-    Ok(Json(json!({"status":"success","token":token,"user":user})))
+    Err(passkeys_unavailable())
+}
+
+fn passkeys_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "status":"error",
+            "message":"Passkey/WebAuthn authentication is disabled until cryptographic assertion verification is configured. Use the admin API key or a signed JWT."
+        })),
+    )
 }
 
 async fn mfa_backup_codes(
@@ -674,13 +624,12 @@ fn claim_values(claims: &serde_json::Value, name: &str) -> Vec<String> {
     }
 }
 
-async fn ensure_admin_auth_tables(pg: Option<&tokio_postgres::Client>) {
+async fn ensure_admin_auth_tables(pg: Option<&tokio_postgres::Client>) -> anyhow::Result<()> {
     let Some(pg) = pg else {
-        return;
+        return Ok(());
     };
-    let _ = pg
-        .batch_execute(
-            "CREATE TABLE IF NOT EXISTS admin_challenges (
+    pg.batch_execute(
+        "CREATE TABLE IF NOT EXISTS admin_challenges (
                 user_name TEXT NOT NULL,
                 purpose TEXT NOT NULL,
                 challenge TEXT NOT NULL,
@@ -704,110 +653,9 @@ async fn ensure_admin_auth_tables(pg: Option<&tokio_postgres::Client>) {
                 user_name TEXT NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL
             );",
-        )
-        .await;
-}
-
-async fn issue_challenge(
-    pg: Option<&tokio_postgres::Client>,
-    payload: Option<Json<UserRequest>>,
-    purpose: &str,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let user = admin_user(payload.and_then(|Json(payload)| payload.user));
-    let challenge = random_token(32);
-    let Some(pg) = pg else {
-        return Err(storage_required());
-    };
-    pg.execute(
-        "INSERT INTO admin_challenges (user_name, purpose, challenge, expires_at)
-         VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes')
-         ON CONFLICT (user_name, purpose) DO UPDATE
-         SET challenge = EXCLUDED.challenge, expires_at = EXCLUDED.expires_at",
-        &[&user, &purpose, &challenge],
     )
-    .await
-    .map_err(|exc| internal_error(exc.to_string()))?;
-    Ok(Json(
-        json!({"status":"challenge_issued","challenge":challenge,"timeout":60000,"user":user}),
-    ))
-}
-
-async fn consume_challenge(
-    pg: Option<&tokio_postgres::Client>,
-    user: &str,
-    purpose: &str,
-    challenge: &str,
-) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
-    let Some(pg) = pg else {
-        return Err(storage_required());
-    };
-    let row = pg
-        .query_opt(
-            "DELETE FROM admin_challenges
-             WHERE user_name = $1 AND purpose = $2 AND challenge = $3 AND expires_at > NOW()
-             RETURNING challenge",
-            &[&user, &purpose, &challenge],
-        )
-        .await
-        .map_err(|exc| internal_error(exc.to_string()))?;
-    Ok(row.is_some())
-}
-
-async fn store_credential(
-    pg: Option<&tokio_postgres::Client>,
-    user: &str,
-    credential_id: &str,
-    public_key: serde_json::Value,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let Some(pg) = pg else {
-        return Err(storage_required());
-    };
-    pg.execute(
-        "INSERT INTO admin_credentials (user_name, credential_id, public_key)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (credential_id) DO UPDATE
-         SET user_name = EXCLUDED.user_name, public_key = EXCLUDED.public_key",
-        &[&user, &credential_id, &public_key],
-    )
-    .await
-    .map_err(|exc| internal_error(exc.to_string()))?;
+    .await?;
     Ok(())
-}
-
-async fn credential_exists(
-    pg: Option<&tokio_postgres::Client>,
-    user: &str,
-    credential_id: &str,
-) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
-    let Some(pg) = pg else {
-        return Err(storage_required());
-    };
-    let row = pg
-        .query_opt(
-            "SELECT 1 FROM admin_credentials WHERE user_name = $1 AND credential_id = $2",
-            &[&user, &credential_id],
-        )
-        .await
-        .map_err(|exc| internal_error(exc.to_string()))?;
-    Ok(row.is_some())
-}
-
-async fn issue_session(
-    pg: Option<&tokio_postgres::Client>,
-    user: &str,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let Some(pg) = pg else {
-        return Err(storage_required());
-    };
-    let token = random_token(32);
-    pg.execute(
-        "INSERT INTO admin_sessions (token, user_name, expires_at)
-         VALUES ($1, $2, NOW() + INTERVAL '12 hours')",
-        &[&token, &user],
-    )
-    .await
-    .map_err(|exc| internal_error(exc.to_string()))?;
-    Ok(token)
 }
 
 async fn ensure_mfa_record(

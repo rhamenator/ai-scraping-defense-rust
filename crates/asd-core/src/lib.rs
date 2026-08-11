@@ -2,7 +2,7 @@ use axum::{http::HeaderMap, response::IntoResponse, routing::get, Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use redis::AsyncCommands;
+use redis::{AsyncCommands, ConnectionAddr, ConnectionInfo, RedisConnectionInfo};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -90,65 +90,84 @@ impl BlocklistState {
         state
     }
 
-    pub async fn block(&self, ip: impl Into<String>) {
+    pub async fn block(&self, ip: impl Into<String>) -> bool {
         let ip = ip.into();
+        if !is_blockable_client_ip(&ip) {
+            tracing::warn!(ip = %ip, "refusing to block an invalid or trusted infrastructure IP");
+            return false;
+        }
+        self.blocked.write().await.insert(ip.clone());
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let result: redis::RedisResult<usize> = con.sadd(&self.blocklist_key, &ip).await;
-                if result.is_ok() {
-                    return;
+                if let Err(exc) = result {
+                    tracing::warn!(error = %exc, ip = %ip, "failed to persist block to Redis; in-memory block remains active");
                 }
             }
         }
-        self.blocked.write().await.insert(ip);
+        true
     }
 
     pub async fn allow(&self, ip: &str) {
+        self.blocked.write().await.remove(ip);
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let result: redis::RedisResult<usize> = con.srem(&self.blocklist_key, ip).await;
-                if result.is_ok() {
-                    return;
+                if let Err(exc) = result {
+                    tracing::warn!(error = %exc, ip, "failed to remove block from Redis; in-memory block was removed");
                 }
             }
         }
-        self.blocked.write().await.remove(ip);
     }
 
     pub async fn flag(&self, ip: impl Into<String>, reason: impl Into<String>) {
         let ip = ip.into();
         let reason = reason.into();
+        self.flagged
+            .write()
+            .await
+            .insert(ip.clone(), reason.clone());
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let result: redis::RedisResult<()> = con
                     .set(format!("{}{}", self.flag_prefix, ip), &reason)
                     .await;
-                if result.is_ok() {
-                    return;
+                if let Err(exc) = result {
+                    tracing::warn!(error = %exc, ip = %ip, "failed to persist flag to Redis; in-memory flag remains active");
                 }
             }
         }
-        self.flagged.write().await.insert(ip, reason);
     }
 
     pub async fn unflag(&self, ip: &str) {
+        self.flagged.write().await.remove(ip);
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let result: redis::RedisResult<usize> =
                     con.del(format!("{}{}", self.flag_prefix, ip)).await;
-                if result.is_ok() {
-                    return;
+                if let Err(exc) = result {
+                    tracing::warn!(error = %exc, ip, "failed to remove flag from Redis; in-memory flag was removed");
                 }
             }
         }
-        self.flagged.write().await.remove(ip);
     }
 
     pub async fn contains(&self, ip: &str) -> bool {
+        if self.blocked.read().await.contains(ip) {
+            if let Some(client) = &self.redis {
+                if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+                    let _: redis::RedisResult<usize> = con.sadd(&self.blocklist_key, ip).await;
+                }
+            }
+            return true;
+        }
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let result: redis::RedisResult<bool> = con.sismember(&self.blocklist_key, ip).await;
                 if let Ok(value) = result {
+                    if value {
+                        self.blocked.write().await.insert(ip.to_string());
+                    }
                     return value;
                 }
             }
@@ -182,12 +201,24 @@ impl BlocklistState {
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let blocked_count: redis::RedisResult<usize> = con.scard(&self.blocklist_key).await;
-                let pattern = format!("{}*", self.flag_prefix);
-                let flagged: redis::RedisResult<Vec<String>> = con.keys(pattern).await;
                 if let Ok(blocked_count) = blocked_count {
+                    let pattern = format!("{}*", self.flag_prefix);
+                    let flagged_count = match con.scan_match::<_, String>(pattern).await {
+                        Ok(mut entries) => {
+                            let mut count = 0;
+                            while entries.next_item().await.is_some() {
+                                count += 1;
+                            }
+                            count
+                        }
+                        Err(exc) => {
+                            tracing::warn!(error = %exc, "failed to scan flagged IP keys");
+                            0
+                        }
+                    };
                     return BlocklistStats {
                         blocked_count,
-                        flagged_count: flagged.map(|values| values.len()).unwrap_or_default(),
+                        flagged_count,
                     };
                 }
             }
@@ -206,13 +237,17 @@ pub fn redis_client_from_env(
     let host = env_string("REDIS_HOST", "localhost");
     let port = env_u16("REDIS_PORT", 6379);
     let db = env_u16(db_env_var, default_db);
-    let password = redis_password();
-    let url = if let Some(password) = password {
-        format!("redis://:{password}@{host}:{port}/{db}")
-    } else {
-        format!("redis://{host}:{port}/{db}")
-    };
-    redis::Client::open(url)
+    redis::Client::open(ConnectionInfo {
+        addr: ConnectionAddr::Tcp(host, port),
+        redis: RedisConnectionInfo {
+            db: i64::from(db),
+            username: env::var("REDIS_USERNAME")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            password: redis_password(),
+            ..RedisConnectionInfo::default()
+        },
+    })
 }
 
 fn redis_password() -> Option<String> {
@@ -323,7 +358,12 @@ pub fn is_authorized(headers: &HeaderMap, api_key_env: &str, jwt_secret_env: &st
         .ok()
         .filter(|value| !value.is_empty());
     if expected_api_key.is_none() && jwt_secret.is_none() {
-        return true;
+        tracing::error!(
+            api_key_env,
+            jwt_secret_env,
+            "authorization secrets are not configured; denying request"
+        );
+        return false;
     }
 
     if let Some(expected) = expected_api_key {
@@ -449,6 +489,16 @@ pub fn tenant_key(base: &str) -> String {
 }
 
 pub fn metrics_text(service: &str, counters: &[(&str, u64)]) -> impl IntoResponse {
+    let service = service
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == ':' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
     let mut body = format!(
         "# HELP {service}_info Service metadata\n# TYPE {service}_info gauge\n{service}_info 1\n"
     );
@@ -456,6 +506,59 @@ pub fn metrics_text(service: &str, counters: &[(&str, u64)]) -> impl IntoRespons
         body.push_str(&format!("{service}_{name} {value}\n"));
     }
     body
+}
+
+pub fn is_blockable_client_ip(candidate: &str) -> bool {
+    let Ok(ip) = candidate.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let trusted_ranges = [
+        "SECURITY_CDN_TRUSTED_PROXY_CIDRS",
+        "SECURITY_TRUSTED_PROXY_CIDRS",
+    ]
+    .into_iter()
+    .filter_map(|name| env::var(name).ok())
+    .flat_map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+
+    !trusted_ranges.into_iter().any(|cidr| ip_in_cidr(ip, &cidr))
+}
+
+fn ip_in_cidr(candidate: std::net::IpAddr, cidr: &str) -> bool {
+    let Some((address, prefix)) = cidr.split_once('/') else {
+        return candidate.to_string() == cidr;
+    };
+    let Ok(network) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    match (candidate, network) {
+        (std::net::IpAddr::V4(candidate), std::net::IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(candidate) & mask == u32::from(network) & mask
+        }
+        (std::net::IpAddr::V6(candidate), std::net::IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(candidate) & mask == u128::from(network) & mask
+        }
+        _ => false,
+    }
 }
 
 pub async fn pg_connect_from_env() -> Option<PgClient> {
@@ -470,8 +573,14 @@ pub async fn pg_connect_from_env() -> Option<PgClient> {
     let db = env_string("PG_DBNAME", "markovdb");
     let user = env_string("PG_USER", "markovuser");
     let password = pg_password().unwrap_or_else(|| env_string("PG_PASSWORD", "markovpass"));
-    let conn_str = format!("host={host} port={port} dbname={db} user={user} password={password}");
-    match tokio_postgres::connect(&conn_str, NoTls).await {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(&host)
+        .port(port)
+        .dbname(&db)
+        .user(&user)
+        .password(password);
+    match config.connect(NoTls).await {
         Ok((client, connection)) => {
             tokio::spawn(async move {
                 if let Err(exc) = connection.await {
@@ -532,25 +641,30 @@ pub async fn record_security_event(
     let Some(pg) = pg else {
         return;
     };
-    if ensure_security_event_table(pg).await.is_err() {
+    if let Err(exc) = ensure_security_event_table(pg).await {
+        tracing::error!(error = %exc, "failed to initialize security event storage");
         return;
     }
-    let _ = pg
+    if let Err(exc) = pg
         .execute(
             "INSERT INTO security_events (event_type, actor, payload) VALUES ($1, $2, $3)",
             &[&event_type, &actor, &payload],
         )
-        .await;
+        .await
+    {
+        tracing::error!(error = %exc, event_type, actor, "failed to persist security event");
+    }
 }
 
 pub async fn load_security_events(pg: Option<&PgClient>, limit: i64) -> Vec<SecurityEvent> {
     let Some(pg) = pg else {
         return Vec::new();
     };
-    if ensure_security_event_table(pg).await.is_err() {
+    if let Err(exc) = ensure_security_event_table(pg).await {
+        tracing::error!(error = %exc, "failed to initialize security event storage");
         return Vec::new();
     }
-    let Ok(rows) = pg
+    let rows = match pg
         .query(
             "SELECT id, event_type, actor, payload, created_at
              FROM security_events
@@ -559,8 +673,12 @@ pub async fn load_security_events(pg: Option<&PgClient>, limit: i64) -> Vec<Secu
             &[&limit],
         )
         .await
-    else {
-        return Vec::new();
+    {
+        Ok(rows) => rows,
+        Err(exc) => {
+            tracing::error!(error = %exc, "failed to load security events");
+            return Vec::new();
+        }
     };
     rows.into_iter()
         .map(|row| SecurityEvent {
@@ -598,5 +716,21 @@ mod tests {
         assert_eq!(claims["sub"], "admin");
         assert!(verify_hs256_jwt(&token, "secret"));
         assert!(decode_hs256_jwt(&token, "wrong").is_none());
+    }
+
+    #[test]
+    fn cidr_matching_distinguishes_origins_from_proxy_ranges() {
+        assert!(ip_in_cidr(
+            "173.245.48.10".parse().unwrap(),
+            "173.245.48.0/20"
+        ));
+        assert!(!ip_in_cidr(
+            "198.51.100.10".parse().unwrap(),
+            "173.245.48.0/20"
+        ));
+        assert!(ip_in_cidr(
+            "2400:cb00::1".parse().unwrap(),
+            "2400:cb00::/32"
+        ));
     }
 }

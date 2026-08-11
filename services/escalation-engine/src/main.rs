@@ -171,7 +171,7 @@ async fn escalate(
     state.requests.fetch_add(1, Ordering::Relaxed);
     let ip = metadata.ip.clone().unwrap_or_else(|| "unknown".to_string());
     let freq = state.frequency.record(&ip).await;
-    let decision = decide(
+    let mut decision = decide(
         metadata,
         freq,
         state.config.throttle_threshold,
@@ -181,8 +181,12 @@ async fn escalate(
     if decision.is_bot {
         state.bots.fetch_add(1, Ordering::Relaxed);
     }
-    if decision.action == "block_ip" && ip != "unknown" {
-        state.blocklist.block(ip.clone()).await;
+    if decision.action == "block_ip" && ip != "unknown" && !state.blocklist.block(ip.clone()).await
+    {
+        decision.action = "observe".to_string();
+        decision.reason.push_str(
+            "; block suppressed because the address is invalid or trusted infrastructure",
+        );
     }
     record_security_event(
         state.pg.as_deref(),
