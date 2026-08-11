@@ -1,6 +1,6 @@
 use asd_core::{
     health, is_authorized, observability_router, pg_connect_from_env, record_security_event, serve,
-    BlocklistState, IpAction, ServiceConfig,
+    AuditStore, BlocklistState, IpAction, ServiceConfig,
 };
 use axum::{
     extract::State,
@@ -14,16 +14,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     blocklist: BlocklistState,
-    pg: Option<Arc<tokio_postgres::Client>>,
+    audit: AuditStore,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("public-blocklist")?;
     let config = ServiceConfig::from_env("public-blocklist", 8011);
+    let pg = pg_connect_from_env().await.map(Arc::new);
     let state = AppState {
         blocklist: BlocklistState::from_env().await,
-        pg: pg_connect_from_env().await.map(Arc::new),
+        audit: AuditStore::from_env(pg).await?,
     };
     let app = Router::new()
         .route(
@@ -60,7 +61,7 @@ async fn report(
         let reason = action.reason.unwrap_or_else(|| "community_report".into());
         state.blocklist.flag(ip.clone(), reason.clone()).await;
         record_security_event(
-            state.pg.as_deref(),
+            &state.audit,
             "public_blocklist_report",
             &ip,
             json!({"ip":ip,"reason":reason}),

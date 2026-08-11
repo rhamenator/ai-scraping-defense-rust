@@ -1,7 +1,7 @@
 use asd_core::{
     env_string, env_u64, health, is_authorized, load_security_events, metrics_text,
     observability_router, pg_connect_from_env, record_security_event, redis_client_from_env, serve,
-    tenant_key, BlocklistState, ServiceConfig,
+    tenant_key, AuditStore, BlocklistState, ServiceConfig,
 };
 use asd_detection::{decide, FrequencyFeatures, InMemoryFrequency, RequestMetadata};
 use axum::{
@@ -122,7 +122,7 @@ struct AppState {
     config: ServiceConfig,
     frequency: FrequencyStore,
     blocklist: BlocklistState,
-    pg: Option<Arc<tokio_postgres::Client>>,
+    audit: AuditStore,
     requests: Arc<AtomicU64>,
     bots: Arc<AtomicU64>,
 }
@@ -140,13 +140,14 @@ struct EscalationResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("escalation-engine")?;
     let config = ServiceConfig::from_env("escalation-engine", 8002);
+    let pg = pg_connect_from_env().await.map(Arc::new);
     let state = AppState {
         config: config.clone(),
         frequency: FrequencyStore::from_env().await,
         blocklist: BlocklistState::from_env().await,
-        pg: pg_connect_from_env().await.map(Arc::new),
+        audit: AuditStore::from_env(pg).await?,
         requests: Arc::new(AtomicU64::new(0)),
         bots: Arc::new(AtomicU64::new(0)),
     };
@@ -189,7 +190,7 @@ async fn escalate(
         );
     }
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "escalation_decision",
         &ip,
         json!({
@@ -223,7 +224,7 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
 }
 
 async fn security_events(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({"events": load_security_events(state.pg.as_deref(), 100).await}))
+    Json(json!({"events": load_security_events(&state.audit, 100).await}))
 }
 
 async fn reload_plugins(
@@ -237,7 +238,7 @@ async fn reload_plugins(
         ));
     }
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "admin_reload_plugins",
         "admin",
         json!({"service":"escalation-engine"}),

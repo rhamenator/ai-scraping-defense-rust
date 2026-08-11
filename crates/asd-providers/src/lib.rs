@@ -270,7 +270,7 @@ impl ModelProvider {
 
         timeout(
             operation_timeout,
-            futures_util::SinkExt::send(&mut socket, Message::Text(rpc_request.to_string())),
+            futures_util::SinkExt::send(&mut socket, Message::Text(rpc_request.to_string().into())),
         )
         .await??;
 
@@ -282,8 +282,8 @@ impl ModelProvider {
         .ok_or_else(|| anyhow::anyhow!("MCP server closed before sending a response"))??;
 
         let response_text = match message {
-            Message::Text(text) => text,
-            Message::Binary(bytes) => String::from_utf8(bytes)?,
+            Message::Text(text) => text.to_string(),
+            Message::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
             other => anyhow::bail!("unexpected MCP websocket response: {other:?}"),
         };
         let response: serde_json::Value = serde_json::from_str(&response_text)?;

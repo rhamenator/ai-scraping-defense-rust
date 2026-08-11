@@ -16,7 +16,7 @@ struct DashboardState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("cloud-dashboard")?;
     let config = ServiceConfig::from_env("cloud-dashboard", 8006);
     let state = DashboardState::default();
     let app = Router::new()

@@ -5,11 +5,11 @@ runtime services.
 
 | Python service | Rust service | Parity status |
 | --- | --- | --- |
-| `src/escalation/escalation_engine.py` | `services/escalation-engine` | Endpoint parity for `/escalate`, `/metrics`, `/admin/reload_plugins`; Redis frequency tracking, Redis blocklist writes, API-key/JWT admin auth, and PostgreSQL security event recording are implemented. |
+| `src/escalation/escalation_engine.py` | `services/escalation-engine` | Endpoint parity for `/escalate`, `/metrics`, `/admin/reload_plugins`; Redis frequency tracking, Redis blocklist writes, API-key/JWT admin auth, and selectable PostgreSQL/JSONL security event recording are implemented. |
 | `src/ai_service/main.py` | `services/ai-service` | Endpoint parity for `/health` and `/webhook`; HMAC verification, Redis block/allow/flag actions, and PostgreSQL audit events are implemented. |
 | `src/tarpit/tarpit_api.py` | `services/tarpit-api` | Endpoint parity for `/health`, `/`, `/tarpit/*`; dynamic HTML generation is implemented in Rust and can pull Markov words from PostgreSQL when available. |
 | `src/admin_ui/admin_ui.py` | `services/admin-ui` | Core admin routes plus persisted passkey/WebAuthn challenge, credential, MFA, backup-code, logout/session flows, metrics, operations triggers, Redis blocklist management, API-key/JWT mutation auth, and PostgreSQL event log reads are implemented. |
-| `src/captcha/*` | `services/captcha-service` | Challenge, solve, and verify endpoints implemented with a local token baseline. |
+| `src/captcha/*` | `services/captcha-service` | Challenge, solve, and verify endpoints accept browser forms or JSON and issue expiring, signed, one-time tokens. |
 | `src/cloud_dashboard/cloud_dashboard_api.py` | `services/cloud-dashboard` | Register, push metrics, fetch metrics, and websocket handshake implemented. |
 | `cloud-proxy/main.py` | `services/cloud-proxy` | `/health` and `/api/chat` endpoint shape implemented; forwards through a provider-adapter crate to `CLOUD_MODEL_API_URL` when configured, supports optional `MODEL_URI=mcp://primary/classify` WebSocket MCP forwarding for `request-guard-mcp`, and reports `not_configured` when no upstream is set. |
 | `prompt-router/main.py` | `services/prompt-router` | `/health` and `/route` endpoint shape implemented with token-based routing and cloud-proxy forwarding. |

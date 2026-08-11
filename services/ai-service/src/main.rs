@@ -1,6 +1,6 @@
 use asd_core::{
     health, observability_router, pg_connect_from_env, record_security_event, serve,
-    verify_hmac_sha256, BlocklistState, ServiceConfig,
+    verify_hmac_sha256, AuditStore, BlocklistState, ServiceConfig,
 };
 use axum::{
     extract::State,
@@ -17,7 +17,7 @@ use std::sync::Arc;
 struct AppState {
     config: ServiceConfig,
     blocklist: BlocklistState,
-    pg: Option<Arc<tokio_postgres::Client>>,
+    audit: AuditStore,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,12 +29,13 @@ struct WebhookAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("ai-service")?;
     let config = ServiceConfig::from_env("ai-service", 8001);
+    let pg = pg_connect_from_env().await.map(Arc::new);
     let state = AppState {
         config: config.clone(),
         blocklist: BlocklistState::from_env().await,
-        pg: pg_connect_from_env().await.map(Arc::new),
+        audit: AuditStore::from_env(pg).await?,
     };
     let app = Router::new()
         .route("/health", get(|| async { health("ai-service").await }))
@@ -72,7 +73,7 @@ async fn webhook(
                 ));
             }
             record_security_event(
-                state.pg.as_deref(),
+                &state.audit,
                 "webhook_block_ip",
                 ip,
                 json!({"ip":ip,"reason":action.reason}),
@@ -84,13 +85,7 @@ async fn webhook(
         }
         "allow_ip" => {
             state.blocklist.allow(ip).await;
-            record_security_event(
-                state.pg.as_deref(),
-                "webhook_allow_ip",
-                ip,
-                json!({"ip":ip}),
-            )
-            .await;
+            record_security_event(&state.audit, "webhook_allow_ip", ip, json!({"ip":ip})).await;
             Ok(Json(
                 json!({"status":"success","message":format!("IP {ip} removed from blocklist.")}),
             ))
@@ -99,7 +94,7 @@ async fn webhook(
             let reason = action.reason.unwrap_or_else(|| "flagged".into());
             state.blocklist.flag(ip.to_string(), reason.clone()).await;
             record_security_event(
-                state.pg.as_deref(),
+                &state.audit,
                 "webhook_flag_ip",
                 ip,
                 json!({"ip":ip,"reason":reason}),
@@ -111,13 +106,7 @@ async fn webhook(
         }
         "unflag_ip" => {
             state.blocklist.unflag(ip).await;
-            record_security_event(
-                state.pg.as_deref(),
-                "webhook_unflag_ip",
-                ip,
-                json!({"ip":ip}),
-            )
-            .await;
+            record_security_event(&state.audit, "webhook_unflag_ip", ip, json!({"ip":ip})).await;
             Ok(Json(
                 json!({"status":"success","message":format!("IP {ip} unflagged.")}),
             ))

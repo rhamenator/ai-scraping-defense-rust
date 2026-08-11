@@ -1,7 +1,7 @@
 use asd_core::{
     decode_hs256_jwt, env_string, health, is_authorized, load_security_events,
-    observability_router, pg_connect_from_env, record_security_event, serve, BlocklistState,
-    IpAction, ServiceConfig,
+    observability_router, pg_connect_from_env, record_security_event, serve, AuditStore,
+    BlocklistState, IpAction, ServiceConfig,
 };
 use axum::{
     extract::{Request, State},
@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -24,16 +24,20 @@ struct AppState {
     config: ServiceConfig,
     blocklist: BlocklistState,
     pg: Option<Arc<tokio_postgres::Client>>,
+    audit: AuditStore,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("admin-ui")?;
     let config = ServiceConfig::from_env("admin-ui", 8004);
+    let pg = pg_connect_from_env().await.map(Arc::new);
+    let audit = AuditStore::from_env(pg.clone()).await?;
     let state = AppState {
         config: config.clone(),
         blocklist: BlocklistState::from_env().await,
-        pg: pg_connect_from_env().await.map(Arc::new),
+        pg,
+        audit,
     };
     ensure_admin_auth_tables(state.pg.as_deref()).await?;
     let app = Router::new()
@@ -154,7 +158,7 @@ async fn settings(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn logs(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({"entries": load_security_events(state.pg.as_deref(), 200).await}))
+    Json(json!({"entries": load_security_events(&state.audit, 200).await}))
 }
 
 async fn plugins() -> Json<serde_json::Value> {
@@ -178,7 +182,7 @@ async fn update_plugins(
         return Err(unauthorized());
     }
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "admin_update_plugins",
         "admin",
         json!({"plugins":[]}),
@@ -210,7 +214,7 @@ async fn block(
             ));
         }
         record_security_event(
-            state.pg.as_deref(),
+            &state.audit,
             "admin_block_ip",
             "admin",
             json!({"ip":ip,"reason":action.reason}),
@@ -232,13 +236,7 @@ async fn unblock(
     }
     if let Some(ip) = action.ip {
         state.blocklist.allow(&ip).await;
-        record_security_event(
-            state.pg.as_deref(),
-            "admin_unblock_ip",
-            "admin",
-            json!({"ip":ip}),
-        )
-        .await;
+        record_security_event(&state.audit, "admin_unblock_ip", "admin", json!({"ip":ip})).await;
         Ok(Json(json!({"status":"success","ip":ip})))
     } else {
         Ok(Json(json!({"status":"error","message":"ip required"})))
@@ -247,7 +245,7 @@ async fn unblock(
 
 async fn gdpr_deletion(State(state): State<AppState>) -> Json<serde_json::Value> {
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "gdpr_deletion_requested",
         "admin",
         json!({"processor":"ai-scraping-defense-rust"}),
@@ -474,7 +472,7 @@ fn admin_user(user: Option<String>) -> String {
 
 fn random_token(bytes: usize) -> String {
     let mut data = vec![0_u8; bytes];
-    rand::thread_rng().fill_bytes(&mut data);
+    rand::rng().fill_bytes(&mut data);
     hex::encode(data)
 }
 
@@ -751,7 +749,7 @@ fn totp_code(secret: &[u8], counter: u64) -> String {
 
 async fn operation_queued(state: AppState, operation: &str) -> Json<serde_json::Value> {
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "admin_operation_queued",
         "admin",
         json!({"operation":operation}),

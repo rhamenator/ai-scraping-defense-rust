@@ -44,7 +44,7 @@ struct Payment {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("pay-per-crawl")?;
     let config = ServiceConfig::from_env("pay-per-crawl", 8012);
     let state = CrawlState {
         crawlers: Arc::default(),

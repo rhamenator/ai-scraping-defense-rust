@@ -14,7 +14,7 @@ struct RouteRequest {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("prompt-router")?;
     let config = ServiceConfig::from_env("prompt-router", 8009);
     let app = Router::new()
         .route("/health", get(|| async { health("prompt-router").await }))

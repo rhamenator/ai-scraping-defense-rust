@@ -42,7 +42,7 @@ struct LabeledRecord {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("rag-trainer")?;
     let config = ServiceConfig::from_env("rag-trainer", 8014);
     let state = TrainerState {
         pg: pg_connect_from_env().await.map(Arc::new),

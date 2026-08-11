@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rand::{distributions::Alphanumeric, prelude::*};
+use rand::{distr::Alphanumeric, prelude::*};
 
 const PREFIXES: &[&str] = &[
     "analytics_bundle",
@@ -16,7 +16,7 @@ pub fn generate_page(path_hint: Option<&str>) -> String {
 }
 
 pub fn generate_page_with_content(path_hint: Option<&str>, content: Option<String>) -> String {
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     let title = random_name(&mut rng, 10);
     let links = generate_fake_links(9, 3);
     let paragraphs = content.unwrap_or_else(|| {
@@ -68,14 +68,14 @@ pub fn generate_page_with_content(path_hint: Option<&str>, content: Option<Strin
 }
 
 pub fn generate_fake_links(count: usize, depth: usize) -> Vec<String> {
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     let mut links = Vec::with_capacity(count);
     for _ in 0..count {
-        let kind = ["page", "js", "data", "styles"][rng.gen_range(0..4)];
-        let dir_count = rng.gen_range(0..=depth);
+        let kind = ["page", "js", "data", "styles"][rng.random_range(0..4)];
+        let dir_count = rng.random_range(0..=depth);
         let dirs = (0..dir_count)
             .map(|_| {
-                let len = rng.gen_range(5..=8);
+                let len = rng.random_range(5..=8);
                 random_name(&mut rng, len)
             })
             .collect::<Vec<_>>();
@@ -83,7 +83,7 @@ pub fn generate_fake_links(count: usize, depth: usize) -> Vec<String> {
             "page" => "html",
             "js" => "js",
             "data" => {
-                if rng.gen_bool(0.5) {
+                if rng.random_bool(0.5) {
                     "json"
                 } else {
                     "xml"
@@ -105,22 +105,22 @@ pub fn generate_fake_links(count: usize, depth: usize) -> Vec<String> {
 }
 
 pub fn realistic_js_filename() -> String {
-    let mut rng = thread_rng();
-    let prefix = PREFIXES[rng.gen_range(0..PREFIXES.len())];
+    let mut rng = rand::rng();
+    let prefix = PREFIXES[rng.random_range(0..PREFIXES.len())];
     format!("{prefix}_{}.js", random_name(&mut rng, 8))
 }
 
 pub fn fake_js_module(target_size: usize) -> String {
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     let name = realistic_js_filename();
     let mut content = format!(
         "// Fake module: {name}\n// Generated: {}\n(function() {{\n",
         Utc::now().to_rfc3339()
     );
-    for _ in 0..rng.gen_range(5..=18) {
-        let name_len = rng.gen_range(4..=10);
+    for _ in 0..rng.random_range(5..=18) {
+        let name_len = rng.random_range(4..=10);
         let var_name = random_alpha(&mut rng, name_len);
-        let value = rng.gen_range(0..1000);
+        let value = rng.random_range(0..1000);
         content.push_str(&format!("  var {var_name} = {value};\n"));
     }
     content.push_str("})();\n");
@@ -151,13 +151,13 @@ fn fake_paragraph(rng: &mut ThreadRng) -> String {
         "operator",
         "threshold",
     ];
-    let len = rng.gen_range(42..=76);
+    let len = rng.random_range(42..=76);
     let mut out = String::new();
     for idx in 0..len {
         if idx > 0 {
             out.push(' ');
         }
-        out.push_str(words[rng.gen_range(0..words.len())]);
+        out.push_str(words[rng.random_range(0..words.len())]);
     }
     out.push('.');
     out
@@ -173,6 +173,6 @@ fn random_name(rng: &mut ThreadRng, len: usize) -> String {
 
 fn random_alpha(rng: &mut ThreadRng, len: usize) -> String {
     (0..len)
-        .map(|_| (b'a' + rng.gen_range(0..26)) as char)
+        .map(|_| (b'a' + rng.random_range(0..26)) as char)
         .collect()
 }

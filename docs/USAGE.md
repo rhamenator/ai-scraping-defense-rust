@@ -21,8 +21,11 @@ Important settings:
 
 - `REDIS_HOST`, `REDIS_PORT`: Redis connection used by blocklist and frequency tracking.
 - `POSTGRES_ENABLED`, `PG_HOST`, `PG_PORT`, `PG_DBNAME`, `PG_USER`, `PG_PASSWORD`: PostgreSQL connection used by persisted service state.
+- `AUDIT_STORAGE_BACKEND`: `auto` (default), `postgres`, `jsonl`, or `disabled`. `auto` uses PostgreSQL when connected and initializes a JSONL store at `AUDIT_JSONL_PATH` otherwise. Explicit PostgreSQL selection fails startup if the database is unavailable; invalid backend names also fail startup.
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: optional HTTP(S) OTLP/gRPC collector endpoint. When set, all shared-server HTTP spans are batch-exported with W3C `traceparent` extraction and flushed during process shutdown; malformed endpoints fail startup.
 - `ADMIN_API_KEY`, `ESCALATION_API_KEY`, `PUBLIC_BLOCKLIST_API_KEY`, `JWT_SECRET`: API-key and JWT protection for mutation routes.
 - `WEBHOOK_SHARED_SECRET`: HMAC secret for AI service webhooks.
+- `CAPTCHA_TOKEN_SECRET`, `CAPTCHA_TOKEN_TTL_SECONDS`: shared HMAC key and lifetime for one-time CAPTCHA verification tokens. Configure the same secret on every CAPTCHA replica.
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
 - `MODEL_URI=mcp://primary/classify` plus `MCP_SERVER_PRIMARY_URL`, `MCP_SERVER_PRIMARY_AUTH_TOKEN`, and `MCP_SERVER_PRIMARY_TIMEOUT`: optional MCP model proxying compatible with `request-guard-mcp`. Leave `MODEL_URI` unset to keep MCP disabled.
 - `PAYMENT_GATEWAY_URL`, `PAYMENT_PROVIDER`, `PAYMENT_API_KEY`: optional payment gateway forwarding for pay-per-crawl flows.
@@ -32,7 +35,7 @@ Important settings:
 
 Cloudflare is treated as an ingress/CDN boundary, not as a general outbound proxy. Ordinary model, payment, rules, and backend requests continue directly to their configured destinations, avoiding unnecessary Cloudflare traffic charges. When Cloudflare integration is enabled and the request/bot thresholds are exceeded, `config-recommender` returns an advisory to consider Under Attack Mode; it never changes the Cloudflare account automatically.
 
-Each service also accepts a `*_PORT` variable matching its package name in uppercase, for example `ESCALATION_ENGINE_PORT` or `RAG_TRAINER_PORT`.
+Each service also accepts a `*_PORT` variable matching its package name in uppercase, for example `ESCALATION_ENGINE_PORT` or `RAG_TRAINER_PORT`. Security-event writers report persistence and malformed-record errors through structured logs instead of silently discarding them.
 
 ## Run One Service
 

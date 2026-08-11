@@ -14,7 +14,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("tarpit-api")?;
     let config = ServiceConfig::from_env("tarpit-api", 8003);
     let state = AppState {
         pg: pg_connect_from_env().await.map(Arc::new),

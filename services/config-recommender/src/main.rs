@@ -5,7 +5,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("config-recommender")?;
     let config = ServiceConfig::from_env("config-recommender", 8007);
     let app = Router::new()
         .route(

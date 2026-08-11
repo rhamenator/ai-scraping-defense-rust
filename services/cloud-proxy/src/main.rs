@@ -9,7 +9,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("cloud-proxy")?;
     let config = ServiceConfig::from_env("cloud-proxy", 8008);
     let app = Router::new()
         .route("/health", get(|| async { health("cloud-proxy").await }))

@@ -1,7 +1,23 @@
-use axum::{http::HeaderMap, response::IntoResponse, routing::get, Json, Router};
+use anyhow::Context as _;
+use axum::{
+    extract::Request,
+    http::HeaderMap,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
+use opentelemetry::propagation::TextMapPropagator as _;
+use opentelemetry::trace::{
+    SpanKind, Status, TraceContextExt as _, Tracer as _, TracerProvider as _,
+};
+use opentelemetry::{Context as OtelContext, KeyValue};
+use opentelemetry_http::HeaderExtractor;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource};
 use redis::{AsyncCommands, ConnectionAddr, ConnectionInfo, RedisConnectionInfo};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -9,12 +25,24 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpListener,
+    sync::{Mutex, RwLock},
+};
 use tokio_postgres::{Client as PgClient, NoTls};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 type HmacSha256 = Hmac<Sha256>;
+static OTEL_EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -33,7 +61,9 @@ impl ServiceConfig {
         Self {
             service_name: service_name.to_string(),
             port: env_u16(&format!("{env_prefix}_PORT"), default_port),
-            webhook_shared_secret: env::var("WEBHOOK_SHARED_SECRET").ok(),
+            webhook_shared_secret: env::var("WEBHOOK_SHARED_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             escalation_threshold: env_f64("ESCALATION_THRESHOLD", 0.70),
             throttle_threshold: env_f64("ESCALATION_THROTTLE_THRESHOLD", 0.72),
             tarpit_threshold: env_f64("ESCALATION_TARPIT_THRESHOLD", 0.82),
@@ -432,20 +462,88 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-pub fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tower_http=warn".into()),
-        )
-        .json()
-        .try_init();
+pub struct TelemetryGuard {
+    provider: Option<SdkTracerProvider>,
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = &self.provider {
+            if let Err(exc) = provider.shutdown() {
+                tracing::error!(error = %exc, "failed to flush OTLP traces during shutdown");
+            }
+        }
+    }
+}
+
+pub fn init_tracing(service_name: &str) -> anyhow::Result<TelemetryGuard> {
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,tower_http=info".into());
+    let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let provider = if let Some(endpoint) = endpoint {
+        let uri = endpoint
+            .parse::<axum::http::Uri>()
+            .context("OTEL_EXPORTER_OTLP_ENDPOINT is not a valid URI")?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+            anyhow::bail!("OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) OTLP/gRPC endpoint");
+        }
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .context("failed to build configured OTLP trace exporter")?;
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                Resource::builder()
+                    .with_service_name(service_name.to_string())
+                    .build(),
+            )
+            .build();
+        let tracer = provider.tracer(service_name.to_string());
+        opentelemetry::global::set_tracer_provider(provider.clone());
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .try_init()
+            .context("failed to initialize tracing subscriber")?;
+        Some(provider)
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .try_init()
+            .context("failed to initialize tracing subscriber")?;
+        None
+    };
+
+    OTEL_EXPORT_ENABLED.store(provider.is_some(), Ordering::Relaxed);
+    tracing::info!(
+        service = service_name,
+        otlp = provider.is_some(),
+        "tracing initialized"
+    );
+    Ok(TelemetryGuard { provider })
 }
 
 pub async fn serve(app: Router, config: ServiceConfig) -> anyhow::Result<()>
 where
     anyhow::Error: From<std::io::Error>,
 {
+    let app = if OTEL_EXPORT_ENABLED.load(Ordering::Relaxed) {
+        app.layer(middleware::from_fn(otel_http_trace))
+    } else {
+        app.layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+    };
     let listener = TcpListener::bind(config.bind_addr()).await?;
     tracing::info!(
         service = config.service_name,
@@ -454,6 +552,44 @@ where
     );
     axum::serve(listener, app.into_make_service()).await?;
     Ok(())
+}
+
+async fn otel_http_trace(request: Request, next: Next) -> Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let protocol = format!("{:?}", request.version());
+    let parent = TraceContextPropagator::new().extract(&HeaderExtractor(request.headers()));
+    let tracer = opentelemetry::global::tracer("asd-core-http");
+    let span = tracer
+        .span_builder("http.request")
+        .with_kind(SpanKind::Server)
+        .with_attributes(vec![
+            KeyValue::new("http.request.method", method.clone()),
+            KeyValue::new("url.path", path.clone()),
+            KeyValue::new("network.protocol.version", protocol),
+        ])
+        .start_with_context(&tracer, &parent);
+    let context = OtelContext::new().with_span(span);
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    let span = context.span();
+    span.set_attribute(KeyValue::new(
+        "http.response.status_code",
+        i64::from(status.as_u16()),
+    ));
+    if status.is_server_error() {
+        span.set_status(Status::error(status.to_string()));
+    }
+    span.end();
+    tracing::info!(
+        http.request.method = method,
+        url.path = path,
+        http.response.status_code = status.as_u16(),
+        duration_ms = started.elapsed().as_millis(),
+        "finished processing request"
+    );
+    response
 }
 
 pub fn env_string(name: &str, default: &str) -> String {
@@ -617,6 +753,165 @@ pub struct SecurityEvent {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+pub enum AuditStore {
+    Postgres(Arc<PgClient>),
+    Jsonl {
+        path: Arc<PathBuf>,
+        write_lock: Arc<Mutex<()>>,
+    },
+    Disabled,
+}
+
+impl AuditStore {
+    pub async fn from_env(pg: Option<Arc<PgClient>>) -> anyhow::Result<Self> {
+        let backend = env_string("AUDIT_STORAGE_BACKEND", "auto").to_ascii_lowercase();
+        let store = match backend.as_str() {
+            "auto" if pg.is_some() => Self::Postgres(pg.expect("checked above")),
+            "auto" | "jsonl" => {
+                let path = env_string("AUDIT_JSONL_PATH", "data/security-events.jsonl");
+                Self::jsonl(path).await?
+            }
+            "postgres" | "postgresql" => Self::Postgres(pg.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AUDIT_STORAGE_BACKEND=postgres requires an available PostgreSQL connection"
+                )
+            })?),
+            "disabled" | "none" => {
+                tracing::warn!("security-event persistence is explicitly disabled");
+                Self::Disabled
+            }
+            _ => anyhow::bail!(
+                "AUDIT_STORAGE_BACKEND must be one of: auto, postgres, jsonl, disabled"
+            ),
+        };
+        store.initialize().await?;
+        tracing::info!(backend = store.backend_name(), "audit storage initialized");
+        Ok(store)
+    }
+
+    pub async fn jsonl(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        Ok(Self::Jsonl {
+            path: Arc::new(path),
+            write_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Postgres(_) => "postgres",
+            Self::Jsonl { .. } => "jsonl",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    async fn initialize(&self) -> anyhow::Result<()> {
+        if let Self::Postgres(pg) = self {
+            ensure_security_event_table(pg).await?;
+        }
+        Ok(())
+    }
+
+    async fn record(
+        &self,
+        event_type: &str,
+        actor: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Postgres(pg) => {
+                pg.execute(
+                    "INSERT INTO security_events (event_type, actor, payload) VALUES ($1, $2, $3)",
+                    &[&event_type, &actor, &payload],
+                )
+                .await?;
+            }
+            Self::Jsonl { path, write_lock } => {
+                let _guard = write_lock.lock().await;
+                let event = SecurityEvent {
+                    id: Utc::now().timestamp_micros(),
+                    event_type: event_type.to_string(),
+                    actor: actor.to_string(),
+                    payload,
+                    created_at: Utc::now(),
+                };
+                let mut line = serde_json::to_vec(&event)?;
+                line.push(b'\n');
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.as_ref())
+                    .await?;
+                file.write_all(&line).await?;
+                file.flush().await?;
+            }
+            Self::Disabled => {}
+        }
+        Ok(())
+    }
+
+    async fn load(&self, limit: i64) -> anyhow::Result<Vec<SecurityEvent>> {
+        let limit = limit.clamp(1, 10_000);
+        match self {
+            Self::Postgres(pg) => {
+                let rows = pg
+                    .query(
+                        "SELECT id, event_type, actor, payload, created_at
+                         FROM security_events
+                         ORDER BY created_at DESC
+                         LIMIT $1",
+                        &[&limit],
+                    )
+                    .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| SecurityEvent {
+                        id: row.get(0),
+                        event_type: row.get(1),
+                        actor: row.get(2),
+                        payload: row.get(3),
+                        created_at: row.get(4),
+                    })
+                    .collect())
+            }
+            Self::Jsonl { path, .. } => {
+                let contents = tokio::fs::read_to_string(path.as_ref()).await?;
+                let mut events = Vec::new();
+                for (line_number, line) in contents.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<SecurityEvent>(line) {
+                        Ok(event) => events.push(event),
+                        Err(exc) => tracing::warn!(
+                            error = %exc,
+                            line = line_number + 1,
+                            path = %path.display(),
+                            "skipping malformed audit JSONL record"
+                        ),
+                    }
+                }
+                events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                events.truncate(limit as usize);
+                Ok(events)
+            }
+            Self::Disabled => Ok(Vec::new()),
+        }
+    }
+}
+
 pub async fn ensure_security_event_table(pg: &PgClient) -> Result<(), tokio_postgres::Error> {
     pg.execute(
         "CREATE TABLE IF NOT EXISTS security_events (
@@ -633,62 +928,24 @@ pub async fn ensure_security_event_table(pg: &PgClient) -> Result<(), tokio_post
 }
 
 pub async fn record_security_event(
-    pg: Option<&PgClient>,
+    store: &AuditStore,
     event_type: &str,
     actor: &str,
     payload: serde_json::Value,
 ) {
-    let Some(pg) = pg else {
-        return;
-    };
-    if let Err(exc) = ensure_security_event_table(pg).await {
-        tracing::error!(error = %exc, "failed to initialize security event storage");
-        return;
-    }
-    if let Err(exc) = pg
-        .execute(
-            "INSERT INTO security_events (event_type, actor, payload) VALUES ($1, $2, $3)",
-            &[&event_type, &actor, &payload],
-        )
-        .await
-    {
+    if let Err(exc) = store.record(event_type, actor, payload).await {
         tracing::error!(error = %exc, event_type, actor, "failed to persist security event");
     }
 }
 
-pub async fn load_security_events(pg: Option<&PgClient>, limit: i64) -> Vec<SecurityEvent> {
-    let Some(pg) = pg else {
-        return Vec::new();
-    };
-    if let Err(exc) = ensure_security_event_table(pg).await {
-        tracing::error!(error = %exc, "failed to initialize security event storage");
-        return Vec::new();
-    }
-    let rows = match pg
-        .query(
-            "SELECT id, event_type, actor, payload, created_at
-             FROM security_events
-             ORDER BY created_at DESC
-             LIMIT $1",
-            &[&limit],
-        )
-        .await
-    {
-        Ok(rows) => rows,
+pub async fn load_security_events(store: &AuditStore, limit: i64) -> Vec<SecurityEvent> {
+    match store.load(limit).await {
+        Ok(events) => events,
         Err(exc) => {
             tracing::error!(error = %exc, "failed to load security events");
-            return Vec::new();
+            Vec::new()
         }
-    };
-    rows.into_iter()
-        .map(|row| SecurityEvent {
-            id: row.get(0),
-            event_type: row.get(1),
-            actor: row.get(2),
-            payload: row.get(3),
-            created_at: row.get(4),
-        })
-        .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,5 +989,55 @@ mod tests {
             "2400:cb00::1".parse().unwrap(),
             "2400:cb00::/32"
         ));
+    }
+
+    #[test]
+    fn w3c_trace_context_extracts_from_http_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-11111111111111111111111111111111-2222222222222222-01"
+                .parse()
+                .unwrap(),
+        );
+
+        let parent = TraceContextPropagator::new().extract(&HeaderExtractor(&headers));
+        let span_context = parent.span().span_context().clone();
+
+        assert!(span_context.is_valid());
+        assert_eq!(
+            span_context.trace_id().to_string(),
+            "11111111111111111111111111111111"
+        );
+        assert_eq!(span_context.span_id().to_string(), "2222222222222222");
+    }
+
+    #[tokio::test]
+    async fn jsonl_audit_store_round_trips_events() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "asd-core-audit-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let store = AuditStore::jsonl(&path).await.unwrap();
+
+        store
+            .record(
+                "test_event",
+                "test_actor",
+                serde_json::json!({"outcome":"recorded"}),
+            )
+            .await
+            .unwrap();
+        let events = store.load(10).await.unwrap();
+
+        assert_eq!(store.backend_name(), "jsonl");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "test_event");
+        assert_eq!(events[0].payload["outcome"], "recorded");
+        tokio::fs::remove_file(path).await.unwrap();
     }
 }

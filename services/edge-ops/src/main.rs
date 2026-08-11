@@ -1,6 +1,6 @@
 use asd_core::{
     env_string, env_u64, health, is_authorized, observability_router, record_security_event, serve,
-    BlocklistState, ServiceConfig,
+    AuditStore, BlocklistState, ServiceConfig,
 };
 use asd_detection::{decide, FrequencyFeatures, RequestMetadata};
 use axum::{
@@ -22,7 +22,7 @@ use std::{
 #[derive(Clone)]
 struct EdgeState {
     blocklist: BlocklistState,
-    pg: Option<Arc<tokio_postgres::Client>>,
+    audit: AuditStore,
 }
 
 #[derive(Deserialize)]
@@ -48,11 +48,12 @@ struct SyncRequest {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    asd_core::init_tracing();
+    let _telemetry = asd_core::init_tracing("edge-ops")?;
     let config = ServiceConfig::from_env("edge-ops", 8013);
+    let pg = asd_core::pg_connect_from_env().await.map(Arc::new);
     let state = EdgeState {
         blocklist: BlocklistState::from_env().await,
-        pg: asd_core::pg_connect_from_env().await.map(Arc::new),
+        audit: AuditStore::from_env(pg).await?,
     };
     let app = Router::new()
         .route("/health", get(|| async { health("edge-ops").await }))
@@ -121,7 +122,7 @@ async fn reload_waf(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     require_edge_admin(&headers)?;
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "waf_rules_reload_requested",
         "edge-ops",
         json!({"rule_count": payload.rules.len()}),
@@ -203,7 +204,7 @@ async fn sync_blocklist(
     }
     let rejected = payload.ips.len() - accepted;
     record_security_event(
-        state.pg.as_deref(),
+        &state.audit,
         "blocklist_sync_applied",
         payload.source.as_deref().unwrap_or("edge-ops"),
         json!({"accepted":accepted,"rejected":rejected}),
