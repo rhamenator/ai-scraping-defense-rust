@@ -8,7 +8,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asd-core",
- "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "hex",
