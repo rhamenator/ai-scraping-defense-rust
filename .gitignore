@@ -4,3 +4,4 @@ artifacts/
 /data/
 /logs/
 *.profraw
+__pycache__/

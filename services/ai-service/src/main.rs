@@ -118,3 +118,92 @@ async fn webhook(
 fn error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(json!({"status":"error","message":message})))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(webhook_shared_secret: Option<&str>) -> AppState {
+        AppState {
+            config: ServiceConfig {
+                service_name: "ai-service-test".into(),
+                port: 0,
+                webhook_shared_secret: webhook_shared_secret.map(str::to_string),
+                escalation_threshold: 0.7,
+                throttle_threshold: 0.72,
+                tarpit_threshold: 0.82,
+                block_threshold: 0.92,
+            },
+            blocklist: BlocklistState::default(),
+            audit: AuditStore::Disabled,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_webhook_secret_rejects_unsigned_requests() {
+        let result = webhook(
+            State(state(Some("test-webhook-secret"))),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"action":"block_ip","ip":"198.51.100.11"}"#),
+        )
+        .await;
+
+        assert!(matches!(result, Err((StatusCode::UNAUTHORIZED, _))));
+    }
+
+    #[tokio::test]
+    async fn malformed_and_incomplete_payloads_fail_closed() {
+        let malformed = webhook(
+            State(state(None)),
+            HeaderMap::new(),
+            Bytes::from_static(b"not-json"),
+        )
+        .await;
+        assert!(matches!(malformed, Err((StatusCode::BAD_REQUEST, _))));
+
+        let missing_ip = webhook(
+            State(state(None)),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"action":"block_ip"}"#),
+        )
+        .await;
+        assert!(matches!(missing_ip, Err((StatusCode::BAD_REQUEST, _))));
+    }
+
+    #[tokio::test]
+    async fn block_and_allow_actions_change_blocklist_state() {
+        let state = state(None);
+        let ip = "198.51.100.12";
+        let _ = webhook(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from(format!(r#"{{"action":"block_ip","ip":"{ip}"}}"#)),
+        )
+        .await
+        .expect("block action should succeed");
+        assert!(state.blocklist.contains(ip).await);
+
+        let _ = webhook(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from(format!(r#"{{"action":"allow_ip","ip":"{ip}"}}"#)),
+        )
+        .await
+        .expect("allow action should succeed");
+        assert!(!state.blocklist.contains(ip).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_ip_is_never_added_to_blocklist() {
+        let state = state(None);
+        let result = webhook(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"action":"block_ip","ip":"not-an-ip"}"#),
+        )
+        .await;
+
+        assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
+        assert!(state.blocklist.blocked().await.is_empty());
+    }
+}

@@ -18,7 +18,7 @@ runtime services.
 | `src/pay_per_crawl/proxy.py` | `services/pay-per-crawl` | Registration, payment, and proxy charging are implemented with PostgreSQL persistence and optional provider-shaped HTTP payment gateway forwarding via `PAYMENT_GATEWAY_URL`. |
 | `src/admin_ui/sso.py` | `services/admin-ui` | OIDC discovery/explicit-JWKS validation is implemented with asymmetric algorithms, `kid`-based rotation, issuer, audience, expiry, not-before, role, and group checks. SAML-style trusted header validation is also available. |
 | `src/util/*` edge operations | `services/edge-ops` | Robots fetching, WAF rules fetching, WAF reload requests, CDN purge forwarding, TLS/DDoS status, community/peer blocklist sync, and security scoring endpoints are implemented. |
-| `src/rag/training.py` | `services/rag-trainer` | Request labeling, training ingest, PostgreSQL persistence, and fine-tuning JSONL/provenance export are implemented with Rust heuristics. |
+| `src/rag/training.py` | `services/rag-trainer` | Request labeling, training ingest, PostgreSQL persistence, reviewed-label logistic-regression training, and fine-tuning JSONL/provenance export are implemented. The versioned model artifact can be loaded by `escalation-engine` through `DETECTION_MODEL_PATH`. |
 
 ## Intentional Differences
 

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -101,6 +102,80 @@ pub struct Decision {
     pub tls_ja4: Option<String>,
     pub tls_fingerprint_source: Option<String>,
     pub features: ExtractedFeatures,
+}
+
+pub const MODEL_FEATURE_NAMES: [&str; 10] = [
+    "ua_is_known_bad",
+    "ua_is_empty",
+    "ua_library_is_bot",
+    "path_disallowed",
+    "path_is_wp",
+    "referer_is_empty",
+    "ua_is_known_benign_crawler",
+    "request_frequency",
+    "rapid_repeat",
+    "fingerprint_reuse_count",
+];
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrainedLinearModel {
+    pub schema_version: u32,
+    pub algorithm: String,
+    pub feature_names: Vec<String>,
+    pub weights: Vec<f64>,
+    pub bias: f64,
+}
+
+impl TrainedLinearModel {
+    pub fn validate(&self) -> Result<(), String> {
+        let expected = MODEL_FEATURE_NAMES.map(str::to_string);
+        if self.schema_version != 1
+            || self.algorithm != "logistic_regression"
+            || self.feature_names != expected
+            || self.weights.len() != MODEL_FEATURE_NAMES.len()
+            || !self.bias.is_finite()
+            || self.weights.iter().any(|weight| !weight.is_finite())
+        {
+            return Err("unsupported or malformed detection model artifact".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn predict(&self, features: &ExtractedFeatures) -> f64 {
+        let linear = self
+            .weights
+            .iter()
+            .zip(model_feature_vector(features))
+            .fold(self.bias, |sum, (weight, feature)| sum + weight * feature);
+        1.0 / (1.0 + (-linear.clamp(-40.0, 40.0)).exp())
+    }
+}
+
+pub fn load_trained_model(path: impl AsRef<Path>) -> anyhow::Result<TrainedLinearModel> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let model: TrainedLinearModel = serde_json::from_slice(&bytes)?;
+    model
+        .validate()
+        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+    Ok(model)
+}
+
+pub fn model_feature_vector(features: &ExtractedFeatures) -> [f64; 10] {
+    [
+        f64::from(features.ua_is_known_bad),
+        f64::from(features.ua_is_empty),
+        f64::from(features.ua_library_is_bot),
+        f64::from(features.path_disallowed),
+        f64::from(features.path_is_wp),
+        f64::from(features.referer_is_empty),
+        f64::from(features.ua_is_known_benign_crawler),
+        (features.request_frequency as f64 / 100.0).min(1.0),
+        f64::from(u8::from(
+            features.time_since_last_sec >= 0.0 && features.time_since_last_sec < 0.25,
+        )),
+        (features.fingerprint_reuse_count as f64 / 10.0).min(1.0),
+    ]
 }
 
 pub fn extract_features(metadata: &RequestMetadata, freq: FrequencyFeatures) -> ExtractedFeatures {
@@ -233,6 +308,24 @@ pub fn decide(
     tarpit_threshold: f64,
     block_threshold: f64,
 ) -> Decision {
+    decide_with_model(
+        metadata,
+        freq,
+        throttle_threshold,
+        tarpit_threshold,
+        block_threshold,
+        None,
+    )
+}
+
+pub fn decide_with_model(
+    metadata: RequestMetadata,
+    freq: FrequencyFeatures,
+    throttle_threshold: f64,
+    tarpit_threshold: f64,
+    block_threshold: f64,
+    model: Option<&TrainedLinearModel>,
+) -> Decision {
     let tls_ja3 = normalize_ja3(metadata.tls_ja3.as_deref());
     let tls_ja4 = normalize_ja4(metadata.tls_ja4.as_deref());
     let tls_fingerprint_source = (tls_ja3.is_some() || tls_ja4.is_some())
@@ -240,7 +333,9 @@ pub fn decide(
         .flatten();
     let fingerprint = browser_fingerprint(&metadata);
     let features = extract_features(&metadata, freq);
-    let score = score(&features);
+    let score = model
+        .map(|trained| trained.predict(&features))
+        .unwrap_or_else(|| score(&features));
     let action = if score >= block_threshold {
         "block_ip"
     } else if score >= tarpit_threshold {
@@ -254,7 +349,14 @@ pub fn decide(
         is_bot: score >= throttle_threshold,
         score,
         action: action.to_string(),
-        reason: format!("Heuristic score {score:.2}"),
+        reason: format!(
+            "{} score {score:.2}",
+            if model.is_some() {
+                "Trained logistic-regression model"
+            } else {
+                "Heuristic"
+            }
+        ),
         fingerprint,
         tls_ja3,
         tls_ja4,
@@ -404,5 +506,34 @@ mod tests {
         assert!(decision.tls_ja3.is_none());
         assert!(decision.tls_ja4.is_none());
         assert!(decision.tls_fingerprint_source.is_none());
+    }
+
+    #[test]
+    fn trained_model_can_override_the_fixed_heuristic_score() {
+        let model = TrainedLinearModel {
+            schema_version: 1,
+            algorithm: "logistic_regression".into(),
+            feature_names: MODEL_FEATURE_NAMES.map(str::to_string).to_vec(),
+            weights: vec![0.0; MODEL_FEATURE_NAMES.len()],
+            bias: 5.0,
+        };
+        let decision = decide_with_model(
+            RequestMetadata {
+                path: Some("/".into()),
+                user_agent: Some("Mozilla/5.0".into()),
+                ..Default::default()
+            },
+            FrequencyFeatures::default(),
+            0.7,
+            0.82,
+            0.92,
+            Some(&model),
+        );
+
+        assert!(decision.score > 0.99);
+        assert_eq!(decision.action, "block_ip");
+        assert!(decision
+            .reason
+            .starts_with("Trained logistic-regression model"));
     }
 }

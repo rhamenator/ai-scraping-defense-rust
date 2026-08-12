@@ -1,5 +1,8 @@
 use asd_core::{health, observability_router, pg_connect_from_env, serve, ServiceConfig};
-use asd_detection::{decide, FrequencyFeatures, RequestMetadata};
+use asd_detection::{
+    decide, extract_features, model_feature_vector, FrequencyFeatures, RequestMetadata,
+    TrainedLinearModel, MODEL_FEATURE_NAMES,
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -32,6 +35,19 @@ struct BatchRequest {
     records: Vec<LogRecord>,
 }
 
+#[derive(Deserialize)]
+struct ReviewedTrainingRecord {
+    log_data: LogRecord,
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct TrainModelRequest {
+    records: Vec<ReviewedTrainingRecord>,
+    epochs: Option<usize>,
+    learning_rate: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct LabeledRecord {
     log_data: LogRecord,
@@ -52,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { health("rag-trainer").await }))
         .route("/training/label", post(label_records))
         .route("/training/ingest", post(ingest_records))
+        .route("/training/train", post(train_model))
         .route("/finetune/export", post(export_jsonl))
         .merge(observability_router("rag-trainer"))
         .with_state(state);
@@ -129,20 +146,119 @@ async fn export_jsonl(Json(payload): Json<BatchRequest>) -> Json<serde_json::Val
     Json(json!({"status":"success","jsonl":lines.join("\n"),"metadata":metadata}))
 }
 
+async fn train_model(
+    Json(payload): Json<TrainModelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (model, accuracy) = fit_model(payload).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status":"error","message":message})),
+        )
+    })?;
+    Ok(Json(json!({
+        "status":"success",
+        "model":model,
+        "metrics":{
+            "training_accuracy":accuracy,
+            "reviewed_labels_required":true
+        }
+    })))
+}
+
+fn fit_model(request: TrainModelRequest) -> Result<(TrainedLinearModel, f64), String> {
+    if request.records.len() < 2 {
+        return Err("at least two reviewed training records are required".into());
+    }
+    let mut samples = Vec::with_capacity(request.records.len());
+    let mut saw_bot = false;
+    let mut saw_human = false;
+    for record in request.records {
+        let label = match record.label.trim().to_ascii_lowercase().as_str() {
+            "bot" => {
+                saw_bot = true;
+                1.0
+            }
+            "human" => {
+                saw_human = true;
+                0.0
+            }
+            _ => return Err("reviewed labels must be either 'bot' or 'human'".into()),
+        };
+        let metadata = metadata_from_log(&record.log_data);
+        let features = extract_features(&metadata, FrequencyFeatures::default());
+        samples.push((model_feature_vector(&features), label));
+    }
+    if !saw_bot || !saw_human {
+        return Err("training data must contain both bot and human reviewed labels".into());
+    }
+
+    let epochs = request.epochs.unwrap_or(400).clamp(10, 10_000);
+    let learning_rate = request.learning_rate.unwrap_or(0.2).clamp(0.0001, 1.0);
+    let mut weights = vec![0.0; MODEL_FEATURE_NAMES.len()];
+    let mut bias = 0.0;
+    for _ in 0..epochs {
+        let mut weight_gradient = vec![0.0; weights.len()];
+        let mut bias_gradient = 0.0;
+        for (features, label) in &samples {
+            let linear = weights
+                .iter()
+                .zip(features)
+                .fold(bias, |sum, (weight, feature)| sum + weight * feature);
+            let prediction = 1.0 / (1.0 + (-linear).exp());
+            let error = prediction - label;
+            for (gradient, feature) in weight_gradient.iter_mut().zip(features) {
+                *gradient += error * feature;
+            }
+            bias_gradient += error;
+        }
+        let scale = learning_rate / samples.len() as f64;
+        for (weight, gradient) in weights.iter_mut().zip(weight_gradient) {
+            *weight -= scale * gradient;
+        }
+        bias -= scale * bias_gradient;
+    }
+
+    let model = TrainedLinearModel {
+        schema_version: 1,
+        algorithm: "logistic_regression".into(),
+        feature_names: MODEL_FEATURE_NAMES.map(str::to_string).to_vec(),
+        weights,
+        bias,
+    };
+    model.validate()?;
+    let correct = samples
+        .iter()
+        .filter(|(features, label)| {
+            let linear = model
+                .weights
+                .iter()
+                .zip(features)
+                .fold(model.bias, |sum, (weight, feature)| sum + weight * feature);
+            let prediction = 1.0 / (1.0 + (-linear).exp());
+            (prediction >= 0.5) == (*label >= 0.5)
+        })
+        .count();
+    Ok((model, correct as f64 / samples.len() as f64))
+}
+
+fn metadata_from_log(record: &LogRecord) -> RequestMetadata {
+    RequestMetadata {
+        ip: Some(record.ip.clone()),
+        method: Some(record.method.clone().unwrap_or_else(|| "GET".to_string())),
+        path: Some(record.path.clone()),
+        user_agent: Some(record.user_agent.clone().unwrap_or_default()),
+        referer: record.referer.clone(),
+        status: record.status,
+        bytes: record.bytes,
+        ..Default::default()
+    }
+}
+
 fn label_batch(records: Vec<LogRecord>) -> Vec<LabeledRecord> {
     records
         .into_iter()
         .map(|record| {
-            let metadata = RequestMetadata {
-                ip: Some(record.ip.clone()),
-                method: Some(record.method.clone().unwrap_or_else(|| "GET".to_string())),
-                path: Some(record.path.clone()),
-                user_agent: Some(record.user_agent.clone().unwrap_or_default()),
-                referer: record.referer.clone(),
-                status: record.status,
-                bytes: record.bytes,
-                ..Default::default()
-            };
+            let metadata = metadata_from_log(&record);
             let mut decision = decide(metadata, FrequencyFeatures::default(), 0.7, 0.82, 0.92);
             if record.status.is_some_and(|status| status >= 400) {
                 decision.score = (decision.score + 0.10).min(1.0);
@@ -187,4 +303,66 @@ async fn ensure_training_table(pg: Option<&tokio_postgres::Client>) -> anyhow::R
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(user_agent: &str, path: &str, label: &str) -> ReviewedTrainingRecord {
+        ReviewedTrainingRecord {
+            log_data: LogRecord {
+                ip: "198.51.100.20".into(),
+                method: Some("GET".into()),
+                path: path.into(),
+                status: Some(200),
+                bytes: Some(100),
+                referer: Some("https://example.test/".into()),
+                user_agent: Some(user_agent.into()),
+            },
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn reviewed_labels_train_a_valid_predictive_artifact() {
+        let (model, accuracy) = fit_model(TrainModelRequest {
+            records: vec![
+                record("python-requests/2", "/.env", "bot"),
+                record("Scrapy/2", "/wp-admin", "bot"),
+                record("Mozilla/5.0", "/", "human"),
+                record("Mozilla/5.0", "/products", "human"),
+            ],
+            epochs: Some(800),
+            learning_rate: Some(0.2),
+        })
+        .expect("reviewed binary labels should train");
+
+        assert_eq!(model.schema_version, 1);
+        assert_eq!(model.weights.len(), MODEL_FEATURE_NAMES.len());
+        assert!(accuracy >= 0.75);
+        assert!(serde_json::to_string(&model).is_ok());
+    }
+
+    #[test]
+    fn training_rejects_single_class_or_unreviewed_labels() {
+        assert!(fit_model(TrainModelRequest {
+            records: vec![
+                record("python-requests/2", "/.env", "bot"),
+                record("Scrapy/2", "/wp-admin", "bot"),
+            ],
+            epochs: None,
+            learning_rate: None,
+        })
+        .is_err());
+        assert!(fit_model(TrainModelRequest {
+            records: vec![
+                record("python-requests/2", "/.env", "suspicious"),
+                record("Mozilla/5.0", "/", "human"),
+            ],
+            epochs: None,
+            learning_rate: None,
+        })
+        .is_err());
+    }
 }

@@ -251,6 +251,7 @@ impl ModelProvider {
             unreachable!("predict_mcp is only called for MCP providers");
         };
 
+        let request = sanitize_mcp_payload(request);
         let operation_timeout = Duration::from_secs((*timeout_secs).max(1));
         let mut ws_request = self.endpoint.as_str().into_client_request()?;
         if let Some(api_key) = &self.api_key {
@@ -356,6 +357,18 @@ fn anthropic_version() -> String {
     std::env::var("ANTHROPIC_VERSION").unwrap_or_else(|_| "2023-06-01".to_string())
 }
 
+fn sanitize_mcp_payload(mut request: serde_json::Value) -> serde_json::Value {
+    // cloud-proxy accepts public JSON and does not currently terminate or
+    // attest the original client TLS handshake. Do not launder client claims
+    // into request-guard-mcp's TLS provenance fields.
+    if let Some(object) = request.as_object_mut() {
+        object.remove("tls_ja3");
+        object.remove("tls_ja4");
+        object.remove("tls_fingerprint_source");
+    }
+    request
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +389,21 @@ mod tests {
         );
         assert_eq!(parse_mcp_model_uri("mcp://primary"), None);
         assert_eq!(parse_mcp_model_uri("mcp:///classify"), None);
+    }
+
+    #[test]
+    fn mcp_payload_drops_untrusted_tls_fingerprint_claims() {
+        let payload = json!({
+            "ip": "198.51.100.5",
+            "tls_ja3": "72a589da586844d7f0818ce684948eea",
+            "tls_ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+            "tls_fingerprint_source": "client-claim"
+        });
+
+        let sanitized = sanitize_mcp_payload(payload);
+        assert_eq!(sanitized["ip"], "198.51.100.5");
+        assert!(sanitized.get("tls_ja3").is_none());
+        assert!(sanitized.get("tls_ja4").is_none());
+        assert!(sanitized.get("tls_fingerprint_source").is_none());
     }
 }

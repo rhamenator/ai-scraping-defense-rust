@@ -20,7 +20,7 @@ Implemented baseline services:
 - `pay-per-crawl`: crawler registration, payment, proxy charging
 - `prompt-router`: `/health`, `/route`
 - `public-blocklist`: `/list`, `/list/auth`, `/report`
-- `rag-trainer`: request labeling, training ingest, fine-tuning JSONL export
+- `rag-trainer`: request labeling, reviewed-label model training, training ingest, fine-tuning JSONL export
 
 The codebase also tracks API and deployment compatibility with the original Python `ai-scraping-defense` implementation. See [docs/PARITY.md](docs/PARITY.md) for the current parity map.
 
@@ -60,7 +60,7 @@ Detailed setup, configuration, API examples, Docker, and Kubernetes usage are in
 Tagged releases publish:
 
 - `ghcr.io/rhamenator/ai-scraping-defense-rust` container images for the full multi-service runtime image.
-- Linux x64 release bundles containing all service binaries plus checksums.
+- Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon release bundles containing all service binaries plus checksums.
 
 Push a tag such as `v1.0.0` to publish a stable image with version, minor, and `latest` tags. Prerelease tags such as `v1.0.0-rc.1` publish prerelease image and binary assets without moving `latest`.
 

@@ -220,4 +220,26 @@ mod tests {
     async fn arbitrary_nonempty_token_is_rejected() {
         assert!(!state().verify_once("anything").await);
     }
+
+    #[tokio::test]
+    async fn tampered_token_is_rejected_without_consuming_original() {
+        let state = state();
+        let token = state.issue().await;
+        let mut tampered = token.clone();
+        tampered.push('0');
+
+        assert!(!state.verify_once(&tampered).await);
+        assert!(state.verify_once(&token).await);
+    }
+
+    #[tokio::test]
+    async fn wrong_solution_does_not_issue_token() {
+        let body = serde_json::to_vec(&json!({"answer":"robot"})).unwrap();
+        let Json(response) = solve(State(state()), HeaderMap::new(), Bytes::from(body))
+            .await
+            .expect("valid JSON should be accepted");
+
+        assert_eq!(response["success"], false);
+        assert!(response["token"].is_null());
+    }
 }

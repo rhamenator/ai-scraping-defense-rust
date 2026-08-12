@@ -3,7 +3,10 @@ use asd_core::{
     observability_router, pg_connect_from_env, record_security_event, redis_client_from_env, serve,
     tenant_key, AuditStore, BlocklistState, ServiceConfig,
 };
-use asd_detection::{decide, FrequencyFeatures, InMemoryFrequency, RequestMetadata};
+use asd_detection::{
+    decide_with_model, load_trained_model, FrequencyFeatures, InMemoryFrequency, RequestMetadata,
+    TrainedLinearModel,
+};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -123,6 +126,7 @@ struct AppState {
     frequency: FrequencyStore,
     blocklist: BlocklistState,
     audit: AuditStore,
+    model: Option<Arc<TrainedLinearModel>>,
     requests: Arc<AtomicU64>,
     bots: Arc<AtomicU64>,
 }
@@ -143,11 +147,26 @@ async fn main() -> anyhow::Result<()> {
     let _telemetry = asd_core::init_tracing("escalation-engine")?;
     let config = ServiceConfig::from_env("escalation-engine", 8002);
     let pg = pg_connect_from_env().await.map(Arc::new);
+    let model = std::env::var("DETECTION_MODEL_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(load_trained_model)
+        .transpose()?
+        .map(Arc::new);
+    tracing::info!(
+        model = if model.is_some() {
+            "trained"
+        } else {
+            "heuristic"
+        },
+        "configured request detector"
+    );
     let state = AppState {
         config: config.clone(),
         frequency: FrequencyStore::from_env().await,
         blocklist: BlocklistState::from_env().await,
         audit: AuditStore::from_env(pg).await?,
+        model,
         requests: Arc::new(AtomicU64::new(0)),
         bots: Arc::new(AtomicU64::new(0)),
     };
@@ -172,12 +191,13 @@ async fn escalate(
     state.requests.fetch_add(1, Ordering::Relaxed);
     let ip = metadata.ip.clone().unwrap_or_else(|| "unknown".to_string());
     let freq = state.frequency.record(&ip).await;
-    let mut decision = decide(
+    let mut decision = decide_with_model(
         metadata,
         freq,
         state.config.throttle_threshold,
         state.config.tarpit_threshold,
         state.config.block_threshold,
+        state.model.as_deref(),
     );
     if decision.is_bot {
         state.bots.fetch_add(1, Ordering::Relaxed);

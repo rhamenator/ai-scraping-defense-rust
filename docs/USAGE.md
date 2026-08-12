@@ -27,7 +27,15 @@ Important settings:
 - `WEBHOOK_SHARED_SECRET`: HMAC secret for AI service webhooks.
 - `CAPTCHA_TOKEN_SECRET`, `CAPTCHA_TOKEN_TTL_SECONDS`: shared HMAC key and lifetime for one-time CAPTCHA verification tokens. Configure the same secret on every CAPTCHA replica.
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
+- `DETECTION_MODEL_PATH`: optional path to a versioned logistic-regression
+  artifact emitted by `POST /training/train` on `rag-trainer`. The escalation
+  engine validates and loads it once at startup; an invalid configured artifact
+  fails startup, while an unset path retains the documented heuristic fallback.
 - `MODEL_URI=mcp://primary/classify` plus `MCP_SERVER_PRIMARY_URL`, `MCP_SERVER_PRIMARY_AUTH_TOKEN`, and `MCP_SERVER_PRIMARY_TIMEOUT`: optional MCP model proxying compatible with `request-guard-mcp`. Leave `MODEL_URI` unset to keep MCP disabled.
+  The public cloud-proxy strips `tls_ja3`, `tls_ja4`, and
+  `tls_fingerprint_source` from MCP payloads because it does not attest the
+  original client TLS handshake. Add a trusted edge collector integration
+  before forwarding those provenance fields.
 - `PAYMENT_GATEWAY_URL`, `PAYMENT_PROVIDER`, `PAYMENT_API_KEY`: optional payment gateway forwarding for pay-per-crawl flows.
 - `ADMIN_UI_SSO_ENABLED`, `ADMIN_UI_SSO_MODE`, `ADMIN_UI_OIDC_*`, `ADMIN_UI_SAML_*`: admin SSO configuration. OIDC uses provider discovery (or an explicit JWKS URL), asymmetric signatures, `kid` selection, issuer/audience/expiry validation, and a bounded rotating-key cache. HTTP provider URLs are rejected except for loopback development endpoints.
 - `ADMIN_UI_WEBAUTHN_ORIGIN`, `ADMIN_UI_WEBAUTHN_RP_ID`, `ADMIN_UI_WEBAUTHN_RP_NAME`: the browser origin and stable relying-party identity for native passkey registration and authentication. Changing the RP ID after credentials are registered invalidates those credentials. PostgreSQL is required for one-time ceremony state, credentials, and hashed admin sessions.
@@ -76,7 +84,7 @@ Default ports:
 | `public-blocklist` | 8011 | Public blocklist list/report endpoints |
 | `pay-per-crawl` | 8012 | Crawler registration, credit, and proxy charging |
 | `edge-ops` | 8013 | Robots/rules/WAF/CDN/TLS/DDoS/blocklist operations |
-| `rag-trainer` | 8014 | Training ingest and fine-tuning JSONL export |
+| `rag-trainer` | 8014 | Reviewed-label model training, ingest, and fine-tuning JSONL export |
 
 After the stack is up, run:
 
@@ -189,7 +197,7 @@ The Kubernetes and Helm files are starter artifacts. Tune image names, secrets, 
 Release automation runs on tags matching `v*.*.*`:
 
 - `.github/workflows/release-images.yml` publishes `ghcr.io/rhamenator/ai-scraping-defense-rust`.
-- `.github/workflows/release-binaries.yml` builds a Linux x64 tarball containing all service binaries and matching SHA-256 checksums.
+- `.github/workflows/release-binaries.yml` builds native Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon bundles containing all service binaries and matching SHA-256 checksums.
 
 Stable semver tags such as `v1.2.3` publish `1.2.3`, `1.2`, and `latest` image tags. Prerelease tags such as `v1.2.3-rc.1` publish only the prerelease version tag and GitHub prerelease assets.
 
