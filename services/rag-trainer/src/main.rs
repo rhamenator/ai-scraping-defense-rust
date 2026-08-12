@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
+const MAX_TRAINING_RECORDS: usize = 10_000;
+const MAX_TRAINING_STEPS: usize = 2_000_000;
+
 #[derive(Clone)]
 struct TrainerState {
     pg: Option<Arc<tokio_postgres::Client>>,
@@ -166,10 +169,23 @@ async fn train_model(
 }
 
 fn fit_model(request: TrainModelRequest) -> Result<(TrainedLinearModel, f64), String> {
-    if request.records.len() < 2 {
+    let record_count = request.records.len();
+    if record_count < 2 {
         return Err("at least two reviewed training records are required".into());
     }
-    let mut samples = Vec::with_capacity(request.records.len());
+    if record_count > MAX_TRAINING_RECORDS {
+        return Err(format!(
+            "at most {MAX_TRAINING_RECORDS} training records are accepted per request"
+        ));
+    }
+    let epochs = request.epochs.unwrap_or(400).clamp(10, 10_000);
+    if record_count.saturating_mul(epochs) > MAX_TRAINING_STEPS {
+        return Err(format!(
+            "training request exceeds the {MAX_TRAINING_STEPS} record-epoch work limit"
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(record_count);
     let mut saw_bot = false;
     let mut saw_human = false;
     for record in request.records {
@@ -192,7 +208,6 @@ fn fit_model(request: TrainModelRequest) -> Result<(TrainedLinearModel, f64), St
         return Err("training data must contain both bot and human reviewed labels".into());
     }
 
-    let epochs = request.epochs.unwrap_or(400).clamp(10, 10_000);
     let learning_rate = request.learning_rate.unwrap_or(0.2).clamp(0.0001, 1.0);
     let mut weights = vec![0.0; MODEL_FEATURE_NAMES.len()];
     let mut bias = 0.0;
@@ -361,6 +376,35 @@ mod tests {
                 record("Mozilla/5.0", "/", "human"),
             ],
             epochs: None,
+            learning_rate: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn training_rejects_unbounded_memory_and_cpu_requests() {
+        let too_many_records = (0..=MAX_TRAINING_RECORDS)
+            .map(|index| {
+                let label = if index % 2 == 0 { "bot" } else { "human" };
+                record("Mozilla/5.0", "/", label)
+            })
+            .collect();
+        assert!(fit_model(TrainModelRequest {
+            records: too_many_records,
+            epochs: Some(10),
+            learning_rate: None,
+        })
+        .is_err());
+
+        let expensive_records = (0..=(MAX_TRAINING_STEPS / 10_000))
+            .map(|index| {
+                let label = if index % 2 == 0 { "bot" } else { "human" };
+                record("Mozilla/5.0", "/", label)
+            })
+            .collect();
+        assert!(fit_model(TrainModelRequest {
+            records: expensive_records,
+            epochs: Some(10_000),
             learning_rate: None,
         })
         .is_err());
