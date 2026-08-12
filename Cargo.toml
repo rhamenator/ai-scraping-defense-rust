@@ -33,7 +33,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-http = "0.32"
