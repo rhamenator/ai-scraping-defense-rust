@@ -29,7 +29,8 @@ Important settings:
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
 - `MODEL_URI=mcp://primary/classify` plus `MCP_SERVER_PRIMARY_URL`, `MCP_SERVER_PRIMARY_AUTH_TOKEN`, and `MCP_SERVER_PRIMARY_TIMEOUT`: optional MCP model proxying compatible with `request-guard-mcp`. Leave `MODEL_URI` unset to keep MCP disabled.
 - `PAYMENT_GATEWAY_URL`, `PAYMENT_PROVIDER`, `PAYMENT_API_KEY`: optional payment gateway forwarding for pay-per-crawl flows.
-- `ADMIN_UI_SSO_ENABLED`, `ADMIN_UI_SSO_MODE`, `ADMIN_UI_OIDC_*`, `ADMIN_UI_SAML_*`: admin SSO configuration.
+- `ADMIN_UI_SSO_ENABLED`, `ADMIN_UI_SSO_MODE`, `ADMIN_UI_OIDC_*`, `ADMIN_UI_SAML_*`: admin SSO configuration. OIDC uses provider discovery (or an explicit JWKS URL), asymmetric signatures, `kid` selection, issuer/audience/expiry validation, and a bounded rotating-key cache. HTTP provider URLs are rejected except for loopback development endpoints.
+- `ADMIN_UI_WEBAUTHN_ORIGIN`, `ADMIN_UI_WEBAUTHN_RP_ID`, `ADMIN_UI_WEBAUTHN_RP_NAME`: the browser origin and stable relying-party identity for native passkey registration and authentication. Changing the RP ID after credentials are registered invalidates those credentials. PostgreSQL is required for one-time ceremony state, credentials, and hashed admin sessions.
 - `EDGE_ALLOWED_DOMAINS`, `REAL_BACKEND_HOST`, `RULES_URL`, `CDN_PURGE_URL`: edge operations configuration.
 - `ENABLE_GLOBAL_CDN`, `CLOUD_CDN_PROVIDER`, and `SECURITY_CDN_TRUSTED_PROXY_CIDRS`: optional Cloudflare ingress integration. Configure Cloudflare's published proxy ranges so originating client IPs—not Cloudflare edge addresses—are evaluated and blocked.
 
@@ -82,6 +83,14 @@ After the stack is up, run:
 ```powershell
 .\scripts\parity_smoke.ps1
 ```
+
+Passkey clients use the native ceremony routes:
+
+- `POST /webauthn/register/begin` with an optional `{ "user": "name" }`, authenticated by the admin API key or an existing admin session.
+- `POST /webauthn/register/complete` with `{ "user": "name", "credential": <RegisterPublicKeyCredential> }` and the same admin authorization.
+- `POST /webauthn/login/begin` with the user name, followed by `POST /webauthn/login/complete` with `{ "user": "name", "credential": <PublicKeyCredential> }`.
+
+Successful authentication returns a bearer session token. Only its SHA-256 hash is persisted, it expires according to `ADMIN_UI_SESSION_TTL_SECONDS`, and `/logout` revokes it. The legacy `/passkey/register` and `/passkey/login` routes are aliases for the corresponding begin operations.
 
 ## API Examples
 

@@ -40,6 +40,11 @@ pub struct RequestMetadata {
     pub headers: Option<HashMap<String, String>>,
     pub fingerprint_id: Option<String>,
     pub fingerprint_reuse_count: Option<u64>,
+    /// Validated JA3 value supplied by a trusted TLS collector or CDN adapter.
+    pub tls_ja3: Option<String>,
+    /// Validated canonical JA4 value supplied by a trusted TLS collector or CDN adapter.
+    pub tls_ja4: Option<String>,
+    pub tls_fingerprint_source: Option<String>,
     /// Set only after forward-confirmed reverse DNS or equivalent provider verification.
     pub verified_bot: Option<bool>,
 }
@@ -92,6 +97,9 @@ pub struct Decision {
     pub action: String,
     pub reason: String,
     pub fingerprint: String,
+    pub tls_ja3: Option<String>,
+    pub tls_ja4: Option<String>,
+    pub tls_fingerprint_source: Option<String>,
     pub features: ExtractedFeatures,
 }
 
@@ -154,9 +162,40 @@ pub fn browser_fingerprint(metadata: &RequestMetadata) -> String {
         header(headers, "accept"),
         header(headers, "sec-ch-ua"),
         header(headers, "sec-fetch-site"),
+        normalize_ja3(metadata.tls_ja3.as_deref()).unwrap_or_default(),
+        normalize_ja4(metadata.tls_ja4.as_deref()).unwrap_or_default(),
     ];
     let raw = parts.join("|");
     hex::encode(Sha256::digest(raw.as_bytes()))
+}
+
+pub fn normalize_ja3(value: Option<&str>) -> Option<String> {
+    let candidate = value?.trim().to_ascii_lowercase();
+    (candidate.len() == 32 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(candidate)
+}
+
+pub fn normalize_ja4(value: Option<&str>) -> Option<String> {
+    let candidate = value?.trim().to_ascii_lowercase();
+    let mut sections = candidate.split('_');
+    let a = sections.next()?;
+    let b = sections.next()?;
+    let c = sections.next()?;
+    if sections.next().is_some()
+        || a.len() != 10
+        || !a
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || b.len() != 12
+        || c.len() != 12
+        || !b
+            .bytes()
+            .chain(c.bytes())
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(candidate)
 }
 
 fn header(headers: &HashMap<String, String>, name: &str) -> String {
@@ -194,6 +233,11 @@ pub fn decide(
     tarpit_threshold: f64,
     block_threshold: f64,
 ) -> Decision {
+    let tls_ja3 = normalize_ja3(metadata.tls_ja3.as_deref());
+    let tls_ja4 = normalize_ja4(metadata.tls_ja4.as_deref());
+    let tls_fingerprint_source = (tls_ja3.is_some() || tls_ja4.is_some())
+        .then(|| metadata.tls_fingerprint_source.clone())
+        .flatten();
     let fingerprint = browser_fingerprint(&metadata);
     let features = extract_features(&metadata, freq);
     let score = score(&features);
@@ -212,6 +256,9 @@ pub fn decide(
         action: action.to_string(),
         reason: format!("Heuristic score {score:.2}"),
         fingerprint,
+        tls_ja3,
+        tls_ja4,
+        tls_fingerprint_source,
         features,
     }
 }
@@ -305,5 +352,57 @@ mod tests {
         assert!(is_disallowed_path("/admin"));
         assert!(is_disallowed_path("/admin/users"));
         assert!(!is_disallowed_path("/administrator"));
+    }
+
+    #[test]
+    fn tls_fingerprints_are_validated_and_contribute_to_tracking_identity() {
+        let metadata = RequestMetadata {
+            user_agent: Some("Mozilla/5.0".into()),
+            tls_ja3: Some("72A589DA586844D7F0818CE684948EEA".into()),
+            tls_ja4: Some("T13D1516H2_8DAAF6152771_E5627EFA2AB1".into()),
+            tls_fingerprint_source: Some("envoy".into()),
+            ..Default::default()
+        };
+        let decision = decide(
+            metadata.clone(),
+            FrequencyFeatures::default(),
+            0.7,
+            0.82,
+            0.92,
+        );
+
+        assert_eq!(
+            decision.tls_ja3.as_deref(),
+            Some("72a589da586844d7f0818ce684948eea")
+        );
+        assert_eq!(
+            decision.tls_ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1")
+        );
+        assert_eq!(decision.tls_fingerprint_source.as_deref(), Some("envoy"));
+
+        let mut without_tls = metadata;
+        without_tls.tls_ja3 = None;
+        without_tls.tls_ja4 = None;
+        assert_ne!(browser_fingerprint(&without_tls), decision.fingerprint);
+    }
+
+    #[test]
+    fn malformed_tls_fingerprints_are_discarded() {
+        let decision = decide(
+            RequestMetadata {
+                tls_ja3: Some("not-a-ja3".into()),
+                tls_ja4: Some("not-a-ja4".into()),
+                tls_fingerprint_source: Some("untrusted".into()),
+                ..Default::default()
+            },
+            FrequencyFeatures::default(),
+            0.7,
+            0.82,
+            0.92,
+        );
+        assert!(decision.tls_ja3.is_none());
+        assert!(decision.tls_ja4.is_none());
+        assert!(decision.tls_fingerprint_source.is_none());
     }
 }

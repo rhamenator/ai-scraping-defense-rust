@@ -16,7 +16,7 @@ runtime services.
 | `src/config_recommender/recommender_api.py` | `services/config-recommender` | `/recommendations` implemented with baseline recommendations. |
 | `src/public_blocklist/public_blocklist_api.py` | `services/public-blocklist` | `/list`, `/list/auth`, and `/report` implemented with Redis-backed state and in-memory fallback. |
 | `src/pay_per_crawl/proxy.py` | `services/pay-per-crawl` | Registration, payment, and proxy charging are implemented with PostgreSQL persistence and optional provider-shaped HTTP payment gateway forwarding via `PAYMENT_GATEWAY_URL`. |
-| `src/admin_ui/sso.py` | `services/admin-ui` | OIDC-style HS256 bearer/header token validation and SAML-style trusted header validation are implemented with issuer, audience, role, and group checks. |
+| `src/admin_ui/sso.py` | `services/admin-ui` | OIDC discovery/explicit-JWKS validation is implemented with asymmetric algorithms, `kid`-based rotation, issuer, audience, expiry, not-before, role, and group checks. SAML-style trusted header validation is also available. |
 | `src/util/*` edge operations | `services/edge-ops` | Robots fetching, WAF rules fetching, WAF reload requests, CDN purge forwarding, TLS/DDoS status, community/peer blocklist sync, and security scoring endpoints are implemented. |
 | `src/rag/training.py` | `services/rag-trainer` | Request labeling, training ingest, PostgreSQL persistence, and fine-tuning JSONL/provenance export are implemented with Rust heuristics. |
 
@@ -32,9 +32,10 @@ runtime services.
   Gemini-compatible, Mistral-compatible, Ollama-compatible, local HTTP, and
   explicitly configured MCP upstreams. Third-party MCP servers are optional and
   are not contacted unless `MODEL_URI` or `MODEL_PROVIDER=mcp` is set.
-- WebAuthn/passkey/MFA routes now persist challenges, credentials, TOTP
-  secrets, backup-code hashes, and sessions. Full FIDO2 attestation and
-  signature verification can be layered onto the stored credential model.
+- WebAuthn/passkey routes use native FIDO2 registration and authentication
+  ceremonies, persist one-time server-side state and passkeys in PostgreSQL,
+  update authenticator counters/backup state, and issue expiring hashed
+  sessions. TOTP secrets and one-use backup-code hashes are also persisted.
 - Payment forwarding supports generic HTTP, Stripe-shaped, PayPal-shaped,
   Braintree-shaped, Square-shaped, Adyen-shaped, Authorize.Net-shaped, and
   internal ledger payloads for customer, charge, refund, and balance flows.

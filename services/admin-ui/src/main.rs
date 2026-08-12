@@ -1,7 +1,10 @@
+mod oidc;
+mod webauthn;
+
 use asd_core::{
-    decode_hs256_jwt, env_string, health, is_authorized, load_security_events,
-    observability_router, pg_connect_from_env, record_security_event, serve, AuditStore,
-    BlocklistState, IpAction, ServiceConfig,
+    env_string, health, is_authorized, load_security_events, observability_router,
+    pg_connect_from_env, record_security_event, serve, AuditStore, BlocklistState, IpAction,
+    ServiceConfig,
 };
 use axum::{
     extract::{Request, State},
@@ -25,6 +28,8 @@ struct AppState {
     blocklist: BlocklistState,
     pg: Option<Arc<tokio_postgres::Client>>,
     audit: AuditStore,
+    oidc: oidc::OidcVerifier,
+    passkeys: Arc<webauthn::PasskeyService>,
 }
 
 #[tokio::main]
@@ -33,11 +38,15 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env("admin-ui", 8004);
     let pg = pg_connect_from_env().await.map(Arc::new);
     let audit = AuditStore::from_env(pg.clone()).await?;
+    let oidc = oidc::OidcVerifier::from_env()?;
+    let passkeys = Arc::new(webauthn::PasskeyService::from_env()?);
     let state = AppState {
         config: config.clone(),
         blocklist: BlocklistState::from_env().await,
         pg,
         audit,
+        oidc,
+        passkeys,
     };
     ensure_admin_auth_tables(state.pg.as_deref()).await?;
     let app = Router::new()
@@ -51,8 +60,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/blocklist", get(blocklist))
         .route("/block", post(block))
         .route("/unblock", post(unblock))
-        .route("/passkey/register", post(passkey_register))
-        .route("/passkey/login", post(passkey_login))
+        .route("/passkey/register", post(webauthn_register_begin))
+        .route("/passkey/login", post(webauthn_login_begin))
         .route("/webauthn/register/begin", post(webauthn_register_begin))
         .route(
             "/webauthn/register/complete",
@@ -74,12 +83,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/operations/rules-fetch", post(operation_rules_fetch))
         .route("/operations/robots-fetch", post(operation_robots_fetch))
         .merge(observability_router("admin-ui"))
-        .layer(middleware::from_fn(require_admin_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_middleware,
+        ))
         .with_state(state);
     serve(app, config).await
 }
 
-async fn require_admin_middleware(request: Request, next: Next) -> Response {
+async fn require_admin_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
     let public_path = matches!(
         path,
@@ -92,8 +108,19 @@ async fn require_admin_middleware(request: Request, next: Next) -> Response {
             | "/webauthn/login/begin"
             | "/webauthn/login/complete"
     );
-    if !public_path && !is_authorized(request.headers(), "ADMIN_API_KEY", "JWT_SECRET") {
-        return unauthorized().into_response();
+    if !public_path {
+        let configured_auth = is_authorized(request.headers(), "ADMIN_API_KEY", "JWT_SECRET");
+        let session_auth = if configured_auth {
+            false
+        } else {
+            match bearer_token(request.headers()) {
+                Some(token) => webauthn::session_is_valid(state.pg.as_deref(), &token).await,
+                None => false,
+            }
+        };
+        if !configured_auth && !session_auth {
+            return unauthorized().into_response();
+        }
     }
     next.run(request).await
 }
@@ -259,6 +286,7 @@ async fn gdpr_report() -> Json<serde_json::Value> {
 }
 
 async fn sso_user(
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if !env_bool("ADMIN_UI_SSO_ENABLED", false) {
@@ -269,7 +297,7 @@ async fn sso_user(
         .as_str()
     {
         "saml" => saml_user(&headers),
-        "oidc" => oidc_user(&headers),
+        "oidc" => oidc_user(&state.oidc, &headers).await,
         _ => Err(bad_request("unsupported SSO mode")),
     }
 }
@@ -285,59 +313,64 @@ struct TotpVerifyRequest {
     code: String,
 }
 
-async fn passkey_register(
-    State(_state): State<AppState>,
-    _headers: HeaderMap,
-    _payload: Option<Json<serde_json::Value>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err(passkeys_unavailable())
-}
-
-async fn passkey_login(
-    State(_state): State<AppState>,
-    _payload: Option<Json<serde_json::Value>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err(passkeys_unavailable())
-}
-
 async fn webauthn_register_begin(
-    State(_state): State<AppState>,
-    _headers: HeaderMap,
-    _payload: Option<Json<UserRequest>>,
+    State(state): State<AppState>,
+    payload: Option<Json<UserRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err(passkeys_unavailable())
+    let user = admin_user(payload.and_then(|Json(payload)| payload.user));
+    state
+        .passkeys
+        .begin_registration(state.pg.as_deref(), &user)
+        .await
 }
 
 async fn webauthn_login_begin(
-    State(_state): State<AppState>,
-    _payload: Option<Json<UserRequest>>,
+    State(state): State<AppState>,
+    payload: Option<Json<UserRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err(passkeys_unavailable())
+    let user = admin_user(payload.and_then(|Json(payload)| payload.user));
+    state
+        .passkeys
+        .begin_authentication(state.pg.as_deref(), &user)
+        .await
 }
 
 async fn webauthn_register_complete(
-    State(_state): State<AppState>,
-    _headers: HeaderMap,
-    Json(_payload): Json<serde_json::Value>,
+    State(state): State<AppState>,
+    Json(payload): Json<webauthn::RegistrationCompleteRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err(passkeys_unavailable())
+    let user = admin_user(payload.user);
+    let response = state
+        .passkeys
+        .complete_registration(state.pg.as_deref(), &user, &payload.credential)
+        .await?;
+    record_security_event(
+        &state.audit,
+        "admin_passkey_registered",
+        &user,
+        json!({"method":"webauthn"}),
+    )
+    .await;
+    Ok(response)
 }
 
 async fn webauthn_login_complete(
-    State(_state): State<AppState>,
-    Json(_payload): Json<serde_json::Value>,
+    State(state): State<AppState>,
+    Json(payload): Json<webauthn::AuthenticationCompleteRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err(passkeys_unavailable())
-}
-
-fn passkeys_unavailable() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "status":"error",
-            "message":"Passkey/WebAuthn authentication is disabled until cryptographic assertion verification is configured. Use the admin API key or a signed JWT."
-        })),
+    let user = admin_user(payload.user);
+    let response = state
+        .passkeys
+        .complete_authentication(state.pg.as_deref(), &user, &payload.credential)
+        .await?;
+    record_security_event(
+        &state.audit,
+        "admin_passkey_authenticated",
+        &user,
+        json!({"method":"webauthn"}),
     )
+    .await;
+    Ok(response)
 }
 
 async fn mfa_backup_codes(
@@ -420,11 +453,7 @@ async fn mfa_backup_code_verify(
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
     if let Some(token) = bearer_token(&headers) {
-        if let Some(pg) = state.pg.as_deref() {
-            let _ = pg
-                .execute("DELETE FROM admin_sessions WHERE token = $1", &[&token])
-                .await;
-        }
+        webauthn::delete_session(state.pg.as_deref(), &token).await;
     }
     Json(json!({"status":"success"}))
 }
@@ -496,7 +525,8 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn oidc_user(
+async fn oidc_user(
+    verifier: &oidc::OidcVerifier,
     headers: &HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let token = bearer_token(headers).or_else(|| {
@@ -509,24 +539,20 @@ fn oidc_user(
     let Some(token) = token else {
         return Err(unauthorized());
     };
-    let secret = env_string("ADMIN_UI_OIDC_JWT_SECRET", "");
-    if secret.is_empty() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status":"error","message":"OIDC JWT secret not configured"})),
-        ));
-    }
-    let Some(claims) = decode_hs256_jwt(&token, &secret) else {
-        return Err(unauthorized());
+    let claims = match verifier.verify(&token).await {
+        Ok(claims) => claims,
+        Err(oidc::OidcError::Unauthorized) => return Err(unauthorized()),
+        Err(oidc::OidcError::Unavailable(message)) => {
+            tracing::warn!(error = %message, "OIDC validation provider unavailable");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status":"error",
+                    "message":"OIDC identity provider is unavailable"
+                })),
+            ));
+        }
     };
-    let issuer = env_string("ADMIN_UI_OIDC_ISSUER", "");
-    if !issuer.is_empty() && claims.get("iss").and_then(|value| value.as_str()) != Some(&issuer) {
-        return Err(unauthorized());
-    }
-    let audience = env_string("ADMIN_UI_OIDC_AUDIENCE", "");
-    if !audience.is_empty() && !claim_matches(&claims, "aud", &audience) {
-        return Err(unauthorized());
-    }
     let roles = claim_values(&claims, "roles")
         .into_iter()
         .chain(claim_values(&claims, "groups"))
@@ -593,15 +619,6 @@ fn saml_user(
     })))
 }
 
-fn claim_matches(claims: &serde_json::Value, name: &str, expected: &str) -> bool {
-    claims.get(name).is_some_and(|value| {
-        value.as_str() == Some(expected)
-            || value
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(expected)))
-    })
-}
-
 fn claim_values(claims: &serde_json::Value, name: &str) -> Vec<String> {
     match claims.get(name) {
         Some(value) if value.is_string() => value
@@ -639,6 +656,10 @@ async fn ensure_admin_auth_tables(pg: Option<&tokio_postgres::Client>) -> anyhow
                 credential_id TEXT PRIMARY KEY,
                 public_key JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS admin_webauthn_users (
+                user_name TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL UNIQUE
             );
             CREATE TABLE IF NOT EXISTS admin_mfa (
                 user_name TEXT PRIMARY KEY,
