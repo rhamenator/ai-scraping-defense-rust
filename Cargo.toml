@@ -27,17 +27,19 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
+aws-lc-rs = "1.18"
 axum = { version = "0.7", features = ["macros", "ws"] }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 hmac = "0.12"
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-http = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] }
+# Force the WebAuthn dependency's OpenSSL backend to build portably on native runners.
 openssl = { version = "0.10", features = ["vendored"] }
 rand = "0.10"
 redis = { version = "0.32", features = ["tokio-comp"] }

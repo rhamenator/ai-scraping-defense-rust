@@ -421,13 +421,12 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
+    use aws_lc_rs::signature::KeyPair as _;
     use axum::{extract::State, routing::get, Json, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use jsonwebtoken::{encode, EncodingKey, Header};
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::rand_core::OsRng;
-    use rsa::traits::PublicKeyParts;
-    use rsa::RsaPrivateKey;
 
     #[test]
     fn symmetric_algorithms_are_never_accepted_for_jwks() {
@@ -524,20 +523,20 @@ mod tests {
     }
 
     fn test_key(kid: &str) -> (EncodingKey, Jwk) {
-        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate test RSA key");
-        let public = private.to_public_key();
-        let der = private.to_pkcs1_der().expect("encode test RSA key");
+        let private = KeyPair::generate(KeySize::Rsa2048).expect("generate test RSA key");
+        let der = private.as_der().expect("encode test RSA key");
+        let public = PublicKeyComponents::<Vec<u8>>::from(private.public_key());
         let jwk: Jwk = serde_json::from_value(serde_json::json!({
             "kty":"RSA",
             "kid":kid,
             "alg":"RS256",
             "use":"sig",
             "key_ops":["verify"],
-            "n":URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
-            "e":URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())
+            "n":URL_SAFE_NO_PAD.encode(public.n),
+            "e":URL_SAFE_NO_PAD.encode(public.e)
         }))
         .expect("build test JWK");
-        (EncodingKey::from_rsa_der(der.as_bytes()), jwk)
+        (EncodingKey::from_rsa_der(der.as_ref()), jwk)
     }
 
     fn test_token(key: &EncodingKey, kid: &str, issuer: &str, audience: &str) -> String {

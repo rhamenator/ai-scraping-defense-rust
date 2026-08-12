@@ -42,6 +42,9 @@ def main() -> None:
         matches = list(root.rglob(args.binary))
         if len(matches) != 1:
             raise RuntimeError(f"expected one {args.binary}, found: {matches}")
+        lockfiles = list(root.rglob("Cargo.lock"))
+        if len(lockfiles) != 1:
+            raise RuntimeError(f"expected packaged Cargo.lock inventory, found: {lockfiles}")
 
         environment = os.environ.copy()
         environment.update(
