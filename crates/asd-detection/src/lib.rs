@@ -46,6 +46,11 @@ pub struct RequestMetadata {
     /// Validated canonical JA4 value supplied by a trusted TLS collector or CDN adapter.
     pub tls_ja4: Option<String>,
     pub tls_fingerprint_source: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub tls_fingerprint_attestation: Option<String>,
+    /// Derived by a verifier inside the service; JSON callers cannot assert it.
+    #[serde(default, skip_deserializing)]
+    pub tls_fingerprint_verified: bool,
     /// Set only after forward-confirmed reverse DNS or equivalent provider verification.
     pub verified_bot: Option<bool>,
 }
@@ -101,6 +106,7 @@ pub struct Decision {
     pub tls_ja3: Option<String>,
     pub tls_ja4: Option<String>,
     pub tls_fingerprint_source: Option<String>,
+    pub tls_fingerprint_verified: bool,
     pub features: ExtractedFeatures,
 }
 
@@ -237,8 +243,16 @@ pub fn browser_fingerprint(metadata: &RequestMetadata) -> String {
         header(headers, "accept"),
         header(headers, "sec-ch-ua"),
         header(headers, "sec-fetch-site"),
-        normalize_ja3(metadata.tls_ja3.as_deref()).unwrap_or_default(),
-        normalize_ja4(metadata.tls_ja4.as_deref()).unwrap_or_default(),
+        metadata
+            .tls_fingerprint_verified
+            .then(|| normalize_ja3(metadata.tls_ja3.as_deref()))
+            .flatten()
+            .unwrap_or_default(),
+        metadata
+            .tls_fingerprint_verified
+            .then(|| normalize_ja4(metadata.tls_ja4.as_deref()))
+            .flatten()
+            .unwrap_or_default(),
     ];
     let raw = parts.join("|");
     hex::encode(Sha256::digest(raw.as_bytes()))
@@ -361,6 +375,7 @@ pub fn decide_with_model(
         tls_ja3,
         tls_ja4,
         tls_fingerprint_source,
+        tls_fingerprint_verified: metadata.tls_fingerprint_verified,
         features,
     }
 }
@@ -467,6 +482,7 @@ mod tests {
             tls_ja3: Some("72A589DA586844D7F0818CE684948EEA".into()),
             tls_ja4: Some("T13D1516H2_8DAAF6152771_E5627EFA2AB1".into()),
             tls_fingerprint_source: Some("envoy".into()),
+            tls_fingerprint_verified: true,
             ..Default::default()
         };
         let decision = decide(
@@ -510,6 +526,17 @@ mod tests {
         assert!(decision.tls_ja3.is_none());
         assert!(decision.tls_ja4.is_none());
         assert!(decision.tls_fingerprint_source.is_none());
+    }
+
+    #[test]
+    fn callers_cannot_deserialize_verified_tls_provenance() {
+        let metadata: RequestMetadata = serde_json::from_value(serde_json::json!({
+            "ip": "198.51.100.7",
+            "tls_ja3": "72a589da586844d7f0818ce684948eea",
+            "tls_fingerprint_verified": true
+        }))
+        .unwrap();
+        assert!(!metadata.tls_fingerprint_verified);
     }
 
     #[test]

@@ -13,8 +13,9 @@ the validated values to the defense origin.
   assert `X-ASD-TLS-JA3` or `X-ASD-TLS-JA4`.
 
 When Cloudflare terminates client TLS, the origin cannot recreate the original
-fingerprint. Enable Cloudflare's managed transform for `cf-ja3-hash` and
-`cf-ja4`, and accept those headers only when the immediate peer is in the
-configured Cloudflare CIDRs. These fields can legitimately be absent. The
-Cloudflare peer address is infrastructure and must never be used as the block
-target; only the validated originating client IP may be blocked.
+fingerprint. JA3 and JA4 are Enterprise Bot Management fields, not automatic
+origin headers. A Worker must delete visitor-supplied copies and populate
+`cf-ja3-hash` and `cf-ja4` from `request.cf.botManagement`; the origin must also
+be isolated with account-scoped Authenticated Origin Pulls, a Tunnel, or
+validated Cloudflare CIDRs. Missing Bot Management values remain unverified and
+do not fail startup. See [the full attestation design](../../docs/TLS_FINGERPRINT_ATTESTATION.md).

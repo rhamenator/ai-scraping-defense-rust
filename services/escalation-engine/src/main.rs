@@ -188,9 +188,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn escalate(
     State(state): State<AppState>,
-    Json(metadata): Json<RequestMetadata>,
+    Json(mut metadata): Json<RequestMetadata>,
 ) -> Json<EscalationResponse> {
     state.requests.fetch_add(1, Ordering::Relaxed);
+    verify_tls_fingerprint(&mut metadata);
     let ip = metadata.ip.clone().unwrap_or_else(|| "unknown".to_string());
     let freq = state.frequency.record(&ip).await;
     let model = state
@@ -225,7 +226,11 @@ async fn escalate(
             "score": decision.score,
             "action": decision.action,
             "reason": decision.reason,
-            "fingerprint": decision.fingerprint
+            "fingerprint": decision.fingerprint,
+            "tls_ja3": decision.tls_ja3,
+            "tls_ja4": decision.tls_ja4,
+            "tls_fingerprint_source": decision.tls_fingerprint_source,
+            "tls_fingerprint_verified": decision.tls_fingerprint_verified
         }),
     )
     .await;
@@ -238,6 +243,40 @@ async fn escalate(
         fingerprint: decision.fingerprint,
         features: serde_json::to_value(decision.features).unwrap_or_else(|_| json!({})),
     })
+}
+
+fn verify_tls_fingerprint(metadata: &mut RequestMetadata) {
+    let fingerprint = asd_core::TlsFingerprint {
+        ja3: asd_core::normalize_ja3(metadata.tls_ja3.as_deref()),
+        ja4: asd_core::normalize_ja4(metadata.tls_ja4.as_deref()),
+        source: asd_core::normalize_tls_source(metadata.tls_fingerprint_source.as_deref())
+            .unwrap_or_default(),
+    };
+    let key = std::env::var("TLS_FINGERPRINT_ATTESTATION_KEY").unwrap_or_default();
+    let previous_key =
+        std::env::var("TLS_FINGERPRINT_ATTESTATION_PREVIOUS_KEY").unwrap_or_default();
+    let max_age = env_u64("TLS_FINGERPRINT_ATTESTATION_MAX_AGE_SECONDS", 60);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    metadata.tls_fingerprint_verified = asd_core::verify_tls_fingerprint_attestation_with_keys(
+        metadata.tls_fingerprint_attestation.as_deref(),
+        &[&key, &previous_key],
+        max_age,
+        &asd_core::TlsAttestationContext {
+            now,
+            client_ip: metadata.ip.as_deref().unwrap_or(""),
+            method: metadata.method.as_deref().unwrap_or("GET"),
+            path: metadata.path.as_deref().unwrap_or(""),
+            fingerprint: &fingerprint,
+        },
+    );
+    metadata.tls_ja3 = fingerprint.ja3;
+    metadata.tls_ja4 = fingerprint.ja4;
+    metadata.tls_fingerprint_source =
+        (!fingerprint.source.is_empty()).then_some(fingerprint.source);
+    metadata.tls_fingerprint_attestation = None;
 }
 
 async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {

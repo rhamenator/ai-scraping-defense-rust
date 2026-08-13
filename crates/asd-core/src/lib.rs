@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use axum::{
-    extract::Request,
+    extract::{connect_info::IntoMakeServiceWithConnectInfo, Request},
     http::HeaderMap,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -382,6 +382,235 @@ pub fn verify_hmac_sha256(secret: &str, body: &[u8], signature_hex: &str) -> boo
     constant_time_eq(expected.as_bytes(), signature_hex.as_bytes())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsFingerprint {
+    pub ja3: Option<String>,
+    pub ja4: Option<String>,
+    pub source: String,
+}
+
+pub fn normalize_ja3(value: Option<&str>) -> Option<String> {
+    let candidate = value?.trim().to_ascii_lowercase();
+    (candidate.len() == 32 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(candidate)
+}
+
+pub fn normalize_ja4(value: Option<&str>) -> Option<String> {
+    let candidate = value?.trim().to_ascii_lowercase();
+    let parts = candidate.split('_').collect::<Vec<_>>();
+    (parts.len() == 3
+        && parts[0].len() == 10
+        && parts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && parts[1].len() == 12
+        && parts[2].len() == 12
+        && parts[1]
+            .bytes()
+            .chain(parts[2].bytes())
+            .all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(candidate)
+}
+
+pub fn normalize_tls_source(value: Option<&str>) -> Option<String> {
+    let candidate = value?.trim().to_ascii_lowercase();
+    (!candidate.is_empty()
+        && candidate.len() <= 32
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(candidate)
+}
+
+fn tls_attestation_message(
+    issued_at: i64,
+    client_ip: &str,
+    method: &str,
+    path: &str,
+    fingerprint: &TlsFingerprint,
+) -> Option<Vec<u8>> {
+    let timestamp = issued_at.to_string();
+    let client_ip = client_ip.trim().to_ascii_lowercase();
+    let method = method.trim().to_ascii_uppercase();
+    let fields = [
+        "v1",
+        timestamp.as_str(),
+        client_ip.as_str(),
+        method.as_str(),
+        path,
+        fingerprint.ja3.as_deref().unwrap_or(""),
+        fingerprint.ja4.as_deref().unwrap_or(""),
+        fingerprint.source.as_str(),
+    ];
+    if fields
+        .iter()
+        .any(|value| value.contains(['\n', '\r', '\0']))
+    {
+        return None;
+    }
+    Some(fields.join("\n").into_bytes())
+}
+
+pub fn create_tls_fingerprint_attestation(
+    key: &str,
+    issued_at: i64,
+    client_ip: &str,
+    method: &str,
+    path: &str,
+    fingerprint: &TlsFingerprint,
+) -> Option<String> {
+    if key.len() < 32 {
+        return None;
+    }
+    let fingerprint = TlsFingerprint {
+        ja3: normalize_ja3(fingerprint.ja3.as_deref()),
+        ja4: normalize_ja4(fingerprint.ja4.as_deref()),
+        source: normalize_tls_source(Some(&fingerprint.source))?,
+    };
+    if fingerprint.ja3.is_none() && fingerprint.ja4.is_none() {
+        return None;
+    }
+    let message = tls_attestation_message(issued_at, client_ip, method, path, &fingerprint)?;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).ok()?;
+    mac.update(&message);
+    Some(format!(
+        "v1:{issued_at}:{}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
+}
+
+pub struct TlsAttestationContext<'a> {
+    pub now: i64,
+    pub client_ip: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub fingerprint: &'a TlsFingerprint,
+}
+
+pub fn verify_tls_fingerprint_attestation(
+    token: Option<&str>,
+    key: &str,
+    max_age_seconds: u64,
+    context: &TlsAttestationContext<'_>,
+) -> bool {
+    verify_tls_fingerprint_attestation_with_keys(token, &[key], max_age_seconds, context)
+}
+
+pub fn verify_tls_fingerprint_attestation_with_keys(
+    token: Option<&str>,
+    keys: &[&str],
+    max_age_seconds: u64,
+    context: &TlsAttestationContext<'_>,
+) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    if max_age_seconds == 0 || !keys.iter().any(|key| key.len() >= 32) {
+        return false;
+    }
+    let parts = token.trim().to_ascii_lowercase();
+    let mut parts = parts.split(':');
+    if parts.next() != Some("v1") {
+        return false;
+    }
+    let Some(issued_at) = parts.next().and_then(|value| value.parse::<i64>().ok()) else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some()
+        || signature.len() != 64
+        || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || context.now.abs_diff(issued_at) > max_age_seconds
+    {
+        return false;
+    }
+    let mut verified = false;
+    for key in keys.iter().filter(|key| key.len() >= 32) {
+        if let Some(expected) = create_tls_fingerprint_attestation(
+            key,
+            issued_at,
+            context.client_ip,
+            context.method,
+            context.path,
+            context.fingerprint,
+        ) {
+            let expected = expected.rsplit(':').next().unwrap_or_default();
+            verified |= constant_time_eq(expected.as_bytes(), signature.as_bytes());
+        }
+    }
+    verified
+}
+
+pub fn trusted_tls_fingerprint(
+    peer_ip: std::net::IpAddr,
+    headers: &HeaderMap,
+) -> Option<TlsFingerprint> {
+    let (ja3_header, ja4_header, source) =
+        if ip_in_configured_ranges(peer_ip, &["SECURITY_CDN_TRUSTED_PROXY_CIDRS"]) {
+            ("cf-ja3-hash", "cf-ja4", "cloudflare")
+        } else if ip_in_configured_ranges(peer_ip, &["SECURITY_TRUSTED_PROXY_CIDRS"]) {
+            ("x-asd-tls-ja3", "x-asd-tls-ja4", "envoy")
+        } else {
+            return None;
+        };
+    let fingerprint = TlsFingerprint {
+        ja3: normalize_ja3(
+            headers
+                .get(ja3_header)
+                .and_then(|value| value.to_str().ok()),
+        ),
+        ja4: normalize_ja4(
+            headers
+                .get(ja4_header)
+                .and_then(|value| value.to_str().ok()),
+        ),
+        source: source.to_string(),
+    };
+    (fingerprint.ja3.is_some() || fingerprint.ja4.is_some()).then_some(fingerprint)
+}
+
+pub fn trusted_originating_client_ip(
+    peer_ip: std::net::IpAddr,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if ip_in_configured_ranges(peer_ip, &["SECURITY_CDN_TRUSTED_PROXY_CIDRS"]) {
+        if let Some(ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+        {
+            return Some(ip.to_string());
+        }
+    }
+    if !ip_in_configured_ranges(
+        peer_ip,
+        &[
+            "SECURITY_CDN_TRUSTED_PROXY_CIDRS",
+            "SECURITY_TRUSTED_PROXY_CIDRS",
+        ],
+    ) {
+        return None;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .iter()
+        .flat_map(|value| value.split(',').rev())
+        .filter_map(|value| value.trim().parse::<std::net::IpAddr>().ok())
+        .find(|candidate| {
+            !ip_in_configured_ranges(
+                *candidate,
+                &[
+                    "SECURITY_CDN_TRUSTED_PROXY_CIDRS",
+                    "SECURITY_TRUSTED_PROXY_CIDRS",
+                ],
+            )
+        })
+        .map(|ip| ip.to_string())
+}
+
 pub fn is_authorized(headers: &HeaderMap, api_key_env: &str, jwt_secret_env: &str) -> bool {
     let expected_api_key = env::var(api_key_env).ok().filter(|value| !value.is_empty());
     let jwt_secret = env::var(jwt_secret_env)
@@ -550,7 +779,9 @@ where
         addr = %config.bind_addr(),
         "service listening"
     );
-    axum::serve(listener, app.into_make_service()).await?;
+    let service: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
+        app.into_make_service_with_connect_info();
+    axum::serve(listener, service).await?;
     Ok(())
 }
 
@@ -648,22 +879,30 @@ pub fn is_blockable_client_ip(candidate: &str) -> bool {
     let Ok(ip) = candidate.parse::<std::net::IpAddr>() else {
         return false;
     };
-    let trusted_ranges = [
-        "SECURITY_CDN_TRUSTED_PROXY_CIDRS",
-        "SECURITY_TRUSTED_PROXY_CIDRS",
-    ]
-    .into_iter()
-    .filter_map(|name| env::var(name).ok())
-    .flat_map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    });
+    !ip_in_configured_ranges(
+        ip,
+        &[
+            "SECURITY_CDN_TRUSTED_PROXY_CIDRS",
+            "SECURITY_TRUSTED_PROXY_CIDRS",
+        ],
+    )
+}
 
-    !trusted_ranges.into_iter().any(|cidr| ip_in_cidr(ip, &cidr))
+fn ip_in_configured_ranges(candidate: std::net::IpAddr, names: &[&str]) -> bool {
+    let trusted_ranges = names
+        .iter()
+        .filter_map(|name| env::var(*name).ok())
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+    trusted_ranges
+        .into_iter()
+        .any(|cidr| ip_in_cidr(candidate, &cidr))
 }
 
 fn ip_in_cidr(candidate: std::net::IpAddr, cidr: &str) -> bool {
@@ -988,6 +1227,105 @@ mod tests {
         assert!(ip_in_cidr(
             "2400:cb00::1".parse().unwrap(),
             "2400:cb00::/32"
+        ));
+    }
+
+    #[test]
+    fn tls_attestation_matches_the_cross_runtime_vector() {
+        let fingerprint = TlsFingerprint {
+            ja3: Some("72a589da586844d7f0818ce684948eea".into()),
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            source: "envoy".into(),
+        };
+        let token = create_tls_fingerprint_attestation(
+            "0123456789abcdef0123456789abcdef",
+            1_700_000_000,
+            "198.51.100.7",
+            "GET",
+            "/products",
+            &fingerprint,
+        )
+        .unwrap();
+        assert_eq!(
+            token,
+            "v1:1700000000:192976122c9fbaa4cb8c2554be66f2439e020a7d470ac838f2a622b0c5829a49"
+        );
+        assert!(verify_tls_fingerprint_attestation(
+            Some(&token),
+            "0123456789abcdef0123456789abcdef",
+            60,
+            &TlsAttestationContext {
+                now: 1_700_000_030,
+                client_ip: "198.51.100.7",
+                method: "GET",
+                path: "/products",
+                fingerprint: &fingerprint,
+            },
+        ));
+    }
+
+    #[test]
+    fn tls_attestation_rejects_get_root_replay_on_post_admin() {
+        let fingerprint = TlsFingerprint {
+            ja3: Some("72a589da586844d7f0818ce684948eea".into()),
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            source: "envoy".into(),
+        };
+        let key = "0123456789abcdef0123456789abcdef";
+        let token = create_tls_fingerprint_attestation(
+            key,
+            1_700_000_000,
+            "198.51.100.7",
+            "GET",
+            "/",
+            &fingerprint,
+        )
+        .unwrap();
+
+        assert!(!verify_tls_fingerprint_attestation(
+            Some(&token),
+            key,
+            60,
+            &TlsAttestationContext {
+                now: 1_700_000_030,
+                client_ip: "198.51.100.7",
+                method: "POST",
+                path: "/admin",
+                fingerprint: &fingerprint,
+            },
+        ));
+    }
+
+    #[test]
+    fn tls_attestation_accepts_previous_key_during_rotation() {
+        let fingerprint = TlsFingerprint {
+            ja3: Some("72a589da586844d7f0818ce684948eea".into()),
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            source: "envoy".into(),
+        };
+        let current_key = "0123456789abcdef0123456789abcdef";
+        let previous_key = "abcdef0123456789abcdef0123456789";
+        let token = create_tls_fingerprint_attestation(
+            previous_key,
+            1_700_000_000,
+            "198.51.100.7",
+            "GET",
+            "/products",
+            &fingerprint,
+        )
+        .unwrap();
+
+        assert!(verify_tls_fingerprint_attestation_with_keys(
+            Some(&token),
+            &[current_key, previous_key],
+            60,
+            &TlsAttestationContext {
+                now: 1_700_000_030,
+                client_ip: "198.51.100.7",
+                method: "GET",
+                path: "/products",
+                fingerprint: &fingerprint,
+            },
         ));
     }
 

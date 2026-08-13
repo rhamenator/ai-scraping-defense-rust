@@ -110,6 +110,7 @@ name = "asd-providers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asd-core",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
@@ -463,6 +464,7 @@ dependencies = [
  "asd-core",
  "asd-providers",
  "axum",
+ "chrono",
  "reqwest 0.12.28",
  "serde_json",
  "tokio",

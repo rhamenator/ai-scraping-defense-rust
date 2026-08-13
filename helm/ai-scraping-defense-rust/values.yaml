@@ -19,6 +19,12 @@ env:
   CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_REQUESTS: "100"
   CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_BOT_RATIO: "0.25"
 
+tlsFingerprints:
+  attestationSecretName: ""
+  attestationKeyKey: tls-fingerprint-attestation-key
+  previousAttestationKeyKey: tls-fingerprint-attestation-previous-key
+  maxAgeSeconds: "60"
+
 services:
   admin-ui:
     command: /usr/local/bin/admin-ui

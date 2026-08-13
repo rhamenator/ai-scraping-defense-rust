@@ -22,6 +22,24 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ $.Release.Name }}-config
+          {{- if or (eq $name "cloud-proxy") (eq $name "escalation-engine") }}
+          env:
+            - name: TLS_FINGERPRINT_ATTESTATION_MAX_AGE_SECONDS
+              value: {{ $.Values.tlsFingerprints.maxAgeSeconds | quote }}
+            {{- if $.Values.tlsFingerprints.attestationSecretName }}
+            - name: TLS_FINGERPRINT_ATTESTATION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.tlsFingerprints.attestationSecretName }}
+                  key: {{ $.Values.tlsFingerprints.attestationKeyKey }}
+            - name: TLS_FINGERPRINT_ATTESTATION_PREVIOUS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.tlsFingerprints.attestationSecretName }}
+                  key: {{ $.Values.tlsFingerprints.previousAttestationKeyKey }}
+                  optional: true
+            {{- end }}
+          {{- end }}
           ports:
             - containerPort: {{ $svc.port }}
 ---

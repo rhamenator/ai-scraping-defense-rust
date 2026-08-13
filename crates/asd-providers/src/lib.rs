@@ -358,13 +358,70 @@ fn anthropic_version() -> String {
 }
 
 fn sanitize_mcp_payload(mut request: serde_json::Value) -> serde_json::Value {
-    // cloud-proxy accepts public JSON and does not currently terminate or
-    // attest the original client TLS handshake. Do not launder client claims
-    // into request-guard-mcp's TLS provenance fields.
     if let Some(object) = request.as_object_mut() {
-        object.remove("tls_ja3");
-        object.remove("tls_ja4");
-        object.remove("tls_fingerprint_source");
+        object.remove("tls_fingerprint_verified");
+        let fingerprint = asd_core::TlsFingerprint {
+            ja3: asd_core::normalize_ja3(object.get("tls_ja3").and_then(serde_json::Value::as_str)),
+            ja4: asd_core::normalize_ja4(object.get("tls_ja4").and_then(serde_json::Value::as_str)),
+            source: asd_core::normalize_tls_source(
+                object
+                    .get("tls_fingerprint_source")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .unwrap_or_default(),
+        };
+        let token = object
+            .get("tls_fingerprint_attestation")
+            .and_then(serde_json::Value::as_str);
+        let key = std::env::var("TLS_FINGERPRINT_ATTESTATION_KEY").unwrap_or_default();
+        let previous_key =
+            std::env::var("TLS_FINGERPRINT_ATTESTATION_PREVIOUS_KEY").unwrap_or_default();
+        let max_age = std::env::var("TLS_FINGERPRINT_ATTESTATION_MAX_AGE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        let verified = asd_core::verify_tls_fingerprint_attestation_with_keys(
+            token,
+            &[&key, &previous_key],
+            max_age,
+            &asd_core::TlsAttestationContext {
+                now,
+                client_ip: object
+                    .get("ip")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                method: object
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GET"),
+                path: object
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                fingerprint: &fingerprint,
+            },
+        );
+        if verified {
+            if let Some(ja3) = fingerprint.ja3 {
+                object.insert("tls_ja3".into(), serde_json::Value::String(ja3));
+            }
+            if let Some(ja4) = fingerprint.ja4 {
+                object.insert("tls_ja4".into(), serde_json::Value::String(ja4));
+            }
+            object.insert(
+                "tls_fingerprint_source".into(),
+                serde_json::Value::String(fingerprint.source),
+            );
+        } else {
+            object.remove("tls_ja3");
+            object.remove("tls_ja4");
+            object.remove("tls_fingerprint_source");
+            object.remove("tls_fingerprint_attestation");
+        }
     }
     request
 }
@@ -405,5 +462,45 @@ mod tests {
         assert!(sanitized.get("tls_ja3").is_none());
         assert!(sanitized.get("tls_ja4").is_none());
         assert!(sanitized.get("tls_fingerprint_source").is_none());
+    }
+
+    #[test]
+    fn mcp_payload_retains_a_valid_bound_attestation() {
+        let key = "0123456789abcdef0123456789abcdef";
+        std::env::set_var("TLS_FINGERPRINT_ATTESTATION_KEY", key);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let fingerprint = asd_core::TlsFingerprint {
+            ja3: Some("72a589da586844d7f0818ce684948eea".into()),
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            source: "envoy".into(),
+        };
+        let token = asd_core::create_tls_fingerprint_attestation(
+            key,
+            now,
+            "198.51.100.5",
+            "GET",
+            "/products",
+            &fingerprint,
+        )
+        .unwrap();
+        let payload = json!({
+            "ip": "198.51.100.5",
+            "method": "GET",
+            "path": "/products",
+            "tls_ja3": fingerprint.ja3,
+            "tls_ja4": fingerprint.ja4,
+            "tls_fingerprint_source": fingerprint.source,
+            "tls_fingerprint_attestation": token
+        });
+        let sanitized = sanitize_mcp_payload(payload);
+        assert_eq!(
+            sanitized["tls_fingerprint_source"],
+            serde_json::Value::String("envoy".into())
+        );
+        assert!(sanitized.get("tls_fingerprint_attestation").is_some());
+        std::env::remove_var("TLS_FINGERPRINT_ATTESTATION_KEY");
     }
 }
