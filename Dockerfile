@@ -9,7 +9,9 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --home-dir /home/appuser --uid 1000 appuser
+    && useradd --create-home --home-dir /home/appuser --uid 1000 appuser \
+    && mkdir -p /models \
+    && chown appuser:appuser /models
 
 COPY --from=builder /app/target/release/admin-ui /usr/local/bin/admin-ui
 COPY --from=builder /app/target/release/ai-service /usr/local/bin/ai-service
@@ -25,5 +27,6 @@ COPY --from=builder /app/target/release/public-blocklist /usr/local/bin/public-b
 COPY --from=builder /app/target/release/rag-trainer /usr/local/bin/rag-trainer
 COPY --from=builder /app/target/release/tarpit-api /usr/local/bin/tarpit-api
 
+WORKDIR /home/appuser
 USER appuser
 ENV RUST_LOG=info

@@ -15,7 +15,7 @@ services:
       ESCALATION_THROTTLE_THRESHOLD: "0.72"
       ESCALATION_TARPIT_THRESHOLD: "0.82"
       ESCALATION_BLOCK_THRESHOLD: "0.92"
-      DETECTION_MODEL_PATH: "${DETECTION_MODEL_PATH:-}"
+      DETECTION_MODEL_PATH: "${DETECTION_MODEL_PATH:-/models/detection-model.json}"
       REDIS_HOST: redis
       REDIS_DB_FREQUENCY: "0"
       REDIS_DB_BLOCKLIST: "0"
@@ -23,11 +23,15 @@ services:
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
       ESCALATION_API_KEY: "${ESCALATION_API_KEY:-}"
       JWT_SECRET: "${JWT_SECRET:-}"
+    # Shared with rag-trainer so a persisted training run can be activated via
+    # POST /admin/reload_model without copying artifacts between containers.
+    volumes:
+      - detection-model:/models
     ports:
       - "8002:8002"
 
@@ -44,9 +48,9 @@ services:
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
     ports:
       - "8001:8001"
 
@@ -59,9 +63,9 @@ services:
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
     ports:
       - "8003:8003"
 
@@ -77,9 +81,9 @@ services:
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
       ADMIN_UI_SSO_ENABLED: "${ADMIN_UI_SSO_ENABLED:-false}"
       ADMIN_UI_SSO_MODE: "${ADMIN_UI_SSO_MODE:-oidc}"
       ADMIN_UI_OIDC_ISSUER: "${ADMIN_UI_OIDC_ISSUER:-}"
@@ -190,9 +194,9 @@ services:
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
       RUST_LOG: info
     ports:
       - "8012:8012"
@@ -214,9 +218,9 @@ services:
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
       RUST_LOG: info
     ports:
       - "8013:8013"
@@ -226,15 +230,34 @@ services:
     command: ["/usr/local/bin/rag-trainer"]
     environment:
       RAG_TRAINER_PORT: "8014"
+      RAG_TRAINER_API_KEY: "${RAG_TRAINER_API_KEY:-}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      DETECTION_MODEL_PATH: "${DETECTION_MODEL_PATH:-/models/detection-model.json}"
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_DBNAME: markovdb
-      PG_USER: markovuser
-      PG_PASSWORD: markovpass
+      PG_DBNAME: "${PG_DBNAME:-markovdb}"
+      PG_USER: "${PG_USER:-markovuser}"
+      PG_PASSWORD: "${PG_PASSWORD:-markovpass}"
       RUST_LOG: info
-    ports:
-      - "8014:8014"
+    volumes:
+      - detection-model:/models
+    # Training ingest/train/export endpoints are deliberately not published to
+    # the host; reach them from inside the compose network only.
+    expose:
+      - "8014"
+
+  # One-off ops client for calling rag-trainer's in-network-only endpoints,
+  # e.g. to persist a trained model (see config/sample.env). Scoped to this
+  # compose project's own network (never a hardcoded name, so it can't
+  # collide with an unrelated project's network) and only starts when
+  # explicitly requested: `docker compose --profile ops run --rm train-model
+  # -sS -X POST http://rag-trainer:8014/training/train ...`. Image is
+  # version-pinned, not `:latest`.
+  train-model:
+    image: curlimages/curl:8.11.1
+    profiles: ["ops"]
+    entrypoint: ["curl"]
 
   redis:
     image: redis:7-alpine
@@ -244,8 +267,11 @@ services:
   postgres:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: markovuser
-      POSTGRES_PASSWORD: markovpass
-      POSTGRES_DB: markovdb
+      POSTGRES_USER: "${PG_USER:-markovuser}"
+      POSTGRES_PASSWORD: "${PG_PASSWORD:-markovpass}"
+      POSTGRES_DB: "${PG_DBNAME:-markovdb}"
     ports:
       - "5432:5432"
+
+volumes:
+  detection-model:

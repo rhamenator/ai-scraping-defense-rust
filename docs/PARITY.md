@@ -5,7 +5,7 @@ runtime services.
 
 | Python service | Rust service | Parity status |
 | --- | --- | --- |
-| `src/escalation/escalation_engine.py` | `services/escalation-engine` | Endpoint parity for `/escalate`, `/metrics`, `/admin/reload_plugins`; Redis frequency tracking, Redis blocklist writes, API-key/JWT admin auth, and selectable PostgreSQL/JSONL security event recording are implemented. |
+| `src/escalation/escalation_engine.py` | `services/escalation-engine` | Endpoint parity for `/escalate`, `/metrics`, `/admin/reload_plugins`, and authenticated `/admin/reload_model`; Redis frequency tracking, Redis blocklist writes, API-key/JWT admin auth, trained-model hot reload, and selectable PostgreSQL/JSONL security event recording are implemented. |
 | `src/ai_service/main.py` | `services/ai-service` | Endpoint parity for `/health` and `/webhook`; HMAC verification, Redis block/allow/flag actions, and PostgreSQL audit events are implemented. |
 | `src/tarpit/tarpit_api.py` | `services/tarpit-api` | Endpoint parity for `/health`, `/`, `/tarpit/*`; dynamic HTML generation is implemented in Rust and can pull Markov words from PostgreSQL when available. |
 | `src/admin_ui/admin_ui.py` | `services/admin-ui` | Core admin routes plus persisted passkey/WebAuthn challenge, credential, MFA, backup-code, logout/session flows, metrics, operations triggers, Redis blocklist management, API-key/JWT mutation auth, and PostgreSQL event log reads are implemented. |
@@ -18,7 +18,7 @@ runtime services.
 | `src/pay_per_crawl/proxy.py` | `services/pay-per-crawl` | Registration, payment, and proxy charging are implemented with PostgreSQL persistence and optional provider-shaped HTTP payment gateway forwarding via `PAYMENT_GATEWAY_URL`. |
 | `src/admin_ui/sso.py` | `services/admin-ui` | OIDC discovery/explicit-JWKS validation is implemented with asymmetric algorithms, `kid`-based rotation, issuer, audience, expiry, not-before, role, and group checks. SAML-style trusted header validation is also available. |
 | `src/util/*` edge operations | `services/edge-ops` | Robots fetching, WAF rules fetching, WAF reload requests, CDN purge forwarding, TLS/DDoS status, community/peer blocklist sync, and security scoring endpoints are implemented. |
-| `src/rag/training.py` | `services/rag-trainer` | Request labeling, training ingest, PostgreSQL persistence, reviewed-label logistic-regression training, and fine-tuning JSONL/provenance export are implemented. The versioned model artifact can be loaded by `escalation-engine` through `DETECTION_MODEL_PATH`. |
+| `src/rag/training.py` | `services/rag-trainer` | Authenticated request labeling, training ingest, PostgreSQL persistence, reviewed-label logistic-regression training, atomic shared-volume model persistence, and fine-tuning JSONL/provenance export are implemented. The versioned model artifact can be loaded or hot-reloaded by `escalation-engine` through `DETECTION_MODEL_PATH`. |
 
 ## Intentional Differences
 

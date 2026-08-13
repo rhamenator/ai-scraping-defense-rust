@@ -126,7 +126,8 @@ struct AppState {
     frequency: FrequencyStore,
     blocklist: BlocklistState,
     audit: AuditStore,
-    model: Option<Arc<TrainedLinearModel>>,
+    model: Arc<std::sync::RwLock<Option<Arc<TrainedLinearModel>>>>,
+    model_path: Option<Arc<String>>,
     requests: Arc<AtomicU64>,
     bots: Arc<AtomicU64>,
 }
@@ -147,12 +148,11 @@ async fn main() -> anyhow::Result<()> {
     let _telemetry = asd_core::init_tracing("escalation-engine")?;
     let config = ServiceConfig::from_env("escalation-engine", 8002);
     let pg = pg_connect_from_env().await.map(Arc::new);
-    let model = std::env::var("DETECTION_MODEL_PATH")
+    let model_path = std::env::var("DETECTION_MODEL_PATH")
         .ok()
         .filter(|path| !path.trim().is_empty())
-        .map(load_trained_model)
-        .transpose()?
         .map(Arc::new);
+    let model = load_model_at_startup(model_path.as_deref().map(String::as_str))?;
     tracing::info!(
         model = if model.is_some() {
             "trained"
@@ -166,7 +166,8 @@ async fn main() -> anyhow::Result<()> {
         frequency: FrequencyStore::from_env().await,
         blocklist: BlocklistState::from_env().await,
         audit: AuditStore::from_env(pg).await?,
-        model,
+        model: Arc::new(std::sync::RwLock::new(model)),
+        model_path,
         requests: Arc::new(AtomicU64::new(0)),
         bots: Arc::new(AtomicU64::new(0)),
     };
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/metrics", get(metrics))
         .route("/security-events", get(security_events))
         .route("/admin/reload_plugins", post(reload_plugins))
+        .route("/admin/reload_model", post(reload_model))
         .merge(observability_router("escalation-engine"))
         .with_state(state);
     serve(app, config).await
@@ -191,13 +193,18 @@ async fn escalate(
     state.requests.fetch_add(1, Ordering::Relaxed);
     let ip = metadata.ip.clone().unwrap_or_else(|| "unknown".to_string());
     let freq = state.frequency.record(&ip).await;
+    let model = state
+        .model
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let mut decision = decide_with_model(
         metadata,
         freq,
         state.config.throttle_threshold,
         state.config.tarpit_threshold,
         state.config.block_threshold,
-        state.model.as_deref(),
+        model.as_deref(),
     );
     if decision.is_bot {
         state.bots.fetch_add(1, Ordering::Relaxed);
@@ -269,4 +276,194 @@ async fn reload_plugins(
         "loaded_plugins": [],
         "message": "Rust service uses compiled extension points; dynamic Python plugins are not loaded."
     })))
+}
+
+/// Load the trained detector from disk, or fall back to heuristics when no
+/// path is configured. A configured-but-unreadable model is an error so a
+/// bad artifact never silently downgrades detection. Used directly by
+/// `/admin/reload_model`, where a missing file must still be reported as an
+/// error rather than silently keeping the previous detector.
+fn load_model(path: Option<&str>) -> anyhow::Result<Option<Arc<TrainedLinearModel>>> {
+    path.map(load_trained_model)
+        .transpose()
+        .map(|model| model.map(Arc::new))
+}
+
+/// Startup variant of `load_model`: a configured path whose file does not
+/// exist yet (e.g. a freshly created, still-empty detection-model volume on
+/// first deploy) falls back to heuristic detection instead of failing to
+/// start, since rag-trainer has simply not persisted a model yet. A path
+/// that exists but is malformed or otherwise unreadable is still a hard
+/// startup failure, same as `load_model`. Uses `try_exists` rather than
+/// `exists`: `exists` collapses any stat error (including permission
+/// denied) to `false`, which would silently downgrade an unreadable
+/// artifact to heuristic detection instead of failing closed; `try_exists`
+/// only reports "missing" for a genuine not-found and propagates other
+/// I/O errors.
+fn load_model_at_startup(path: Option<&str>) -> anyhow::Result<Option<Arc<TrainedLinearModel>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match std::path::Path::new(path).try_exists() {
+        Ok(true) => load_model(Some(path)),
+        Ok(false) => {
+            tracing::warn!(
+                path,
+                "no detection model artifact at the configured path yet; starting with heuristic detection"
+            );
+            Ok(None)
+        }
+        Err(exc) => Err(anyhow::anyhow!(
+            "failed to check detection model artifact at {path}: {exc}"
+        )),
+    }
+}
+
+async fn reload_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !is_authorized(&headers, "ESCALATION_API_KEY", "JWT_SECRET") {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"status":"error","message":"Unauthorized"})),
+        ));
+    }
+    let Some(path) = state.model_path.as_deref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status":"error",
+                "message":"DETECTION_MODEL_PATH is not configured; nothing to reload"
+            })),
+        ));
+    };
+    let model = load_model(Some(path)).map_err(|exc| {
+        tracing::error!(error = %exc, path, "failed to reload trained model; keeping current detector");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status":"error",
+                "message":"failed to load the model artifact; the previous detector remains active"
+            })),
+        )
+    })?;
+    *state
+        .model
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = model;
+    record_security_event(
+        &state.audit,
+        "admin_reload_model",
+        "admin",
+        json!({"service":"escalation-engine","model_path":path}),
+    )
+    .await;
+    Ok(Json(json!({
+        "status":"success",
+        "detector":"trained",
+        "model_path":path
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asd_detection::MODEL_FEATURE_NAMES;
+
+    fn temp_model_path(tag: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "escalation-model-{tag}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn model_reload_swaps_in_a_persisted_artifact() {
+        let path = temp_model_path("valid");
+        let artifact = json!({
+            "schema_version": 1,
+            "algorithm": "logistic_regression",
+            "feature_names": MODEL_FEATURE_NAMES,
+            "weights": vec![0.1; MODEL_FEATURE_NAMES.len()],
+            "bias": -0.5
+        });
+        std::fs::write(&path, artifact.to_string()).unwrap();
+
+        let slot: std::sync::RwLock<Option<Arc<TrainedLinearModel>>> = std::sync::RwLock::new(None);
+        let loaded = load_model(path.to_str()).expect("valid artifact should load");
+        *slot.write().unwrap() = loaded;
+        assert!(slot.read().unwrap().is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unreadable_or_invalid_artifacts_do_not_replace_the_detector() {
+        assert!(load_model(Some("does-not-exist.json")).is_err());
+
+        let path = temp_model_path("invalid");
+        std::fs::write(&path, "{\"not\":\"a model\"}").unwrap();
+        assert!(load_model(path.to_str()).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn no_configured_path_means_heuristic_detection() {
+        assert!(load_model(None).expect("heuristic fallback").is_none());
+    }
+
+    #[test]
+    fn missing_artifact_at_startup_falls_back_to_heuristic_detection() {
+        // A fresh, still-empty shared volume must not block startup.
+        let path = temp_model_path("missing-at-startup");
+        assert!(!path.exists());
+        assert!(load_model_at_startup(path.to_str())
+            .expect("missing artifact at startup should fall back to heuristics")
+            .is_none());
+    }
+
+    #[test]
+    fn existing_malformed_artifact_still_fails_startup() {
+        let path = temp_model_path("malformed-at-startup");
+        std::fs::write(&path, "{\"not\":\"a model\"}").unwrap();
+        assert!(load_model_at_startup(path.to_str()).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_artifact_directory_fails_startup_instead_of_falling_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_model_path("unreadable-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("detection-model.json");
+        std::fs::write(&path, "{}").unwrap();
+        // Strip all permissions from the containing directory so stat()
+        // during try_exists() fails with PermissionDenied rather than
+        // NotFound; load_model_at_startup must propagate that error rather
+        // than treating it as "artifact not present yet".
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = load_model_at_startup(path.to_str());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a permission error while checking the artifact must fail closed, not silently fall back to heuristics"
+        );
+    }
+
+    #[test]
+    fn reload_still_errors_when_artifact_is_missing() {
+        // /admin/reload_model must never silently keep serving the previous
+        // detector when told to load a path that isn't there.
+        assert!(load_model(Some("definitely-does-not-exist.json")).is_err());
+    }
 }

@@ -381,7 +381,11 @@ impl InMemoryFrequency {
     pub async fn record(&self, key: &str, window: Duration) -> FrequencyFeatures {
         let now = std::time::Instant::now();
         let mut guard = self.inner.write().await;
-        if self.operations.fetch_add(1, Ordering::Relaxed) % 1024 == 0 {
+        if self
+            .operations
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(1024)
+        {
             guard.retain(|_, seen| {
                 seen.retain(|entry| now.duration_since(*entry) <= window);
                 !seen.is_empty()

@@ -1,18 +1,26 @@
-use asd_core::{health, observability_router, pg_connect_from_env, serve, ServiceConfig};
+use asd_core::{
+    health, is_authorized, observability_router, pg_connect_from_env, serve, ServiceConfig,
+};
 use asd_detection::{
     decide, extract_features, model_feature_vector, FrequencyFeatures, RequestMetadata,
     TrainedLinearModel, MODEL_FEATURE_NAMES,
 };
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 const MAX_TRAINING_RECORDS: usize = 10_000;
 const MAX_TRAINING_STEPS: usize = 2_000_000;
@@ -20,6 +28,7 @@ const MAX_TRAINING_STEPS: usize = 2_000_000;
 #[derive(Clone)]
 struct TrainerState {
     pg: Option<Arc<tokio_postgres::Client>>,
+    model_path: Option<Arc<PathBuf>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -49,6 +58,8 @@ struct TrainModelRequest {
     records: Vec<ReviewedTrainingRecord>,
     epochs: Option<usize>,
     learning_rate: Option<f64>,
+    #[serde(default)]
+    persist: bool,
 }
 
 #[derive(Serialize)]
@@ -65,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env("rag-trainer", 8014);
     let state = TrainerState {
         pg: pg_connect_from_env().await.map(Arc::new),
+        model_path: std::env::var("DETECTION_MODEL_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(|path| Arc::new(PathBuf::from(path))),
     };
     ensure_training_table(state.pg.as_deref()).await?;
     let app = Router::new()
@@ -78,17 +93,39 @@ async fn main() -> anyhow::Result<()> {
     serve(app, config).await
 }
 
-async fn label_records(Json(payload): Json<BatchRequest>) -> Json<serde_json::Value> {
-    Json(json!({
+type ApiError = (StatusCode, Json<serde_json::Value>);
+
+/// Training data and model artifacts are a poisoning/resource-abuse vector,
+/// so every non-observability route requires the same API-key/JWT gate the
+/// other admin surfaces use. Fails closed when no secret is configured.
+fn authorize(headers: &HeaderMap) -> Result<(), ApiError> {
+    if is_authorized(headers, "RAG_TRAINER_API_KEY", "JWT_SECRET") {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"status":"error","message":"Unauthorized"})),
+        ))
+    }
+}
+
+async fn label_records(
+    headers: HeaderMap,
+    Json(payload): Json<BatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers)?;
+    Ok(Json(json!({
         "status":"success",
         "records": label_batch(payload.records)
-    }))
+    })))
 }
 
 async fn ingest_records(
     State(state): State<TrainerState>,
+    headers: HeaderMap,
     Json(payload): Json<BatchRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers)?;
     let labeled = label_batch(payload.records);
     if let Some(pg) = state.pg.as_deref() {
         for record in &labeled {
@@ -123,7 +160,11 @@ async fn ingest_records(
     Ok(Json(json!({"status":"success","count":labeled.len()})))
 }
 
-async fn export_jsonl(Json(payload): Json<BatchRequest>) -> Json<serde_json::Value> {
+async fn export_jsonl(
+    headers: HeaderMap,
+    Json(payload): Json<BatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers)?;
     let labeled = label_batch(payload.records);
     let lines = labeled
         .iter()
@@ -146,26 +187,97 @@ async fn export_jsonl(Json(payload): Json<BatchRequest>) -> Json<serde_json::Val
             "notes": "Heuristic labels should be reviewed before fine-tuning or sharing model artifacts."
         }
     });
-    Json(json!({"status":"success","jsonl":lines.join("\n"),"metadata":metadata}))
+    Ok(Json(
+        json!({"status":"success","jsonl":lines.join("\n"),"metadata":metadata}),
+    ))
 }
 
 async fn train_model(
+    State(state): State<TrainerState>,
+    headers: HeaderMap,
     Json(payload): Json<TrainModelRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers)?;
+    let persist = payload.persist;
+    if persist && state.model_path.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status":"error",
+                "message":"persist requested but DETECTION_MODEL_PATH is not configured"
+            })),
+        ));
+    }
     let (model, accuracy) = fit_model(payload).map_err(|message| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"status":"error","message":message})),
         )
     })?;
+    let persisted_to = if persist {
+        let path = state.model_path.as_deref().expect("checked above");
+        persist_model(path, &model).map_err(|exc| {
+            tracing::error!(error = %exc, path = %path.display(), "failed to persist trained model");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status":"error","message":"failed to persist trained model"})),
+            )
+        })?;
+        Some(path.display().to_string())
+    } else {
+        None
+    };
     Ok(Json(json!({
         "status":"success",
         "model":model,
+        "persisted_to":persisted_to,
         "metrics":{
             "training_accuracy":accuracy,
             "reviewed_labels_required":true
         }
     })))
+}
+
+/// Monotonic counter that, combined with the process id and a nanosecond
+/// timestamp, keeps every persist_model call's temp file name unique even
+/// when two training requests are persisted concurrently in the same
+/// process.
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".{}.{nanos}.{seq}.tmp", std::process::id()));
+    PathBuf::from(temp)
+}
+
+/// Write the model atomically (unique temp file + rename) so a concurrent
+/// escalation-engine reload never observes a partially written artifact and
+/// overlapping training requests never race on the same temp file name.
+/// std::fs::rename replaces an existing destination on both Unix and Windows
+/// (MOVEFILE_REPLACE_EXISTING), so repeated training runs overwrite in place
+/// and concurrent persists resolve to whichever rename lands last, never a
+/// mix of two artifacts; the temp artifact is removed if its own rename
+/// fails (e.g. a Windows sharing violation while the destination is held
+/// open).
+fn persist_model(path: &Path, model: &TrainedLinearModel) -> anyhow::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = unique_temp_path(path);
+    std::fs::write(&temp, serde_json::to_vec_pretty(model)?)?;
+    if let Err(exc) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(exc.into());
+    }
+    Ok(())
 }
 
 fn fit_model(request: TrainModelRequest) -> Result<(TrainedLinearModel, f64), String> {
@@ -350,6 +462,7 @@ mod tests {
             ],
             epochs: Some(800),
             learning_rate: Some(0.2),
+            persist: false,
         })
         .expect("reviewed binary labels should train");
 
@@ -368,6 +481,7 @@ mod tests {
             ],
             epochs: None,
             learning_rate: None,
+            persist: false,
         })
         .is_err());
         assert!(fit_model(TrainModelRequest {
@@ -377,6 +491,7 @@ mod tests {
             ],
             epochs: None,
             learning_rate: None,
+            persist: false,
         })
         .is_err());
     }
@@ -393,6 +508,7 @@ mod tests {
             records: too_many_records,
             epochs: Some(10),
             learning_rate: None,
+            persist: false,
         })
         .is_err());
 
@@ -406,7 +522,194 @@ mod tests {
             records: expensive_records,
             epochs: Some(10_000),
             learning_rate: None,
+            persist: false,
         })
         .is_err());
+    }
+
+    // is_authorized reads env vars at call time; serialize env-touching tests.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn training_payload() -> TrainModelRequest {
+        TrainModelRequest {
+            records: vec![
+                record("python-requests/2", "/.env", "bot"),
+                record("Scrapy/2", "/wp-admin", "bot"),
+                record("Mozilla/5.0", "/", "human"),
+                record("Mozilla/5.0", "/products", "human"),
+            ],
+            epochs: Some(200),
+            learning_rate: Some(0.2),
+            persist: false,
+        }
+    }
+
+    fn state(model_path: Option<PathBuf>) -> TrainerState {
+        TrainerState {
+            pg: None,
+            model_path: model_path.map(Arc::new),
+        }
+    }
+
+    #[tokio::test]
+    async fn training_routes_fail_closed_without_configured_secrets() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RAG_TRAINER_API_KEY");
+        std::env::remove_var("JWT_SECRET");
+
+        let batch = BatchRequest { records: vec![] };
+        assert!(matches!(
+            label_records(HeaderMap::new(), Json(BatchRequest { records: vec![] })).await,
+            Err((StatusCode::UNAUTHORIZED, _))
+        ));
+        assert!(matches!(
+            ingest_records(State(state(None)), HeaderMap::new(), Json(batch)).await,
+            Err((StatusCode::UNAUTHORIZED, _))
+        ));
+        assert!(matches!(
+            export_jsonl(HeaderMap::new(), Json(BatchRequest { records: vec![] })).await,
+            Err((StatusCode::UNAUTHORIZED, _))
+        ));
+        assert!(matches!(
+            train_model(
+                State(state(None)),
+                HeaderMap::new(),
+                Json(training_payload())
+            )
+            .await,
+            Err((StatusCode::UNAUTHORIZED, _))
+        ));
+    }
+
+    #[tokio::test]
+    async fn training_routes_reject_wrong_key_and_accept_configured_key() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var("RAG_TRAINER_API_KEY", "trainer-test-key");
+        std::env::remove_var("JWT_SECRET");
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert("x-api-key", "not-the-key".parse().unwrap());
+        assert!(matches!(
+            train_model(State(state(None)), wrong, Json(training_payload())).await,
+            Err((StatusCode::UNAUTHORIZED, _))
+        ));
+
+        let mut authorized = HeaderMap::new();
+        authorized.insert("x-api-key", "trainer-test-key".parse().unwrap());
+        let response = train_model(State(state(None)), authorized, Json(training_payload()))
+            .await
+            .expect("authorized training request should succeed");
+        assert_eq!(response.0["status"], "success");
+
+        std::env::remove_var("RAG_TRAINER_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn persist_writes_a_model_the_escalation_engine_can_load() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var("RAG_TRAINER_API_KEY", "trainer-test-key");
+        std::env::remove_var("JWT_SECRET");
+        let mut authorized = HeaderMap::new();
+        authorized.insert("x-api-key", "trainer-test-key".parse().unwrap());
+
+        // Persist without a configured path is rejected before any training work.
+        let mut payload = training_payload();
+        payload.persist = true;
+        assert!(matches!(
+            train_model(State(state(None)), authorized.clone(), Json(payload)).await,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rag-trainer-model-{}-{unique}.json",
+            std::process::id()
+        ));
+        let mut payload = training_payload();
+        payload.persist = true;
+        let response = train_model(State(state(Some(path.clone()))), authorized, Json(payload))
+            .await
+            .expect("persisting training request should succeed");
+        assert_eq!(response.0["persisted_to"], path.display().to_string());
+
+        let loaded = asd_detection::load_trained_model(&path)
+            .expect("persisted artifact should round-trip through the deployment loader");
+        assert_eq!(loaded.weights.len(), MODEL_FEATURE_NAMES.len());
+
+        // A second training run must overwrite the existing artifact in place
+        // (rename onto an existing destination, including on Windows) and
+        // leave no temp file behind.
+        let mut payload = training_payload();
+        payload.persist = true;
+        let mut authorized = HeaderMap::new();
+        authorized.insert("x-api-key", "trainer-test-key".parse().unwrap());
+        let overwrite = train_model(State(state(Some(path.clone()))), authorized, Json(payload))
+            .await
+            .expect("re-training over an existing artifact should succeed");
+        assert_eq!(overwrite.0["status"], "success");
+        asd_detection::load_trained_model(&path).expect("overwritten artifact should still load");
+        assert!(!any_leftover_temp_files(&path));
+
+        std::fs::remove_file(path).unwrap();
+        std::env::remove_var("RAG_TRAINER_API_KEY");
+    }
+
+    fn any_leftover_temp_files(path: &Path) -> bool {
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        let stem = path.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(&stem) && name.ends_with(".tmp")
+            })
+    }
+
+    #[test]
+    fn concurrent_persists_do_not_corrupt_the_artifact_or_leak_temp_files() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rag-trainer-concurrent-model-{}-{unique}.json",
+            std::process::id()
+        ));
+
+        let model_a = TrainedLinearModel {
+            schema_version: 1,
+            algorithm: "logistic_regression".into(),
+            feature_names: MODEL_FEATURE_NAMES.map(str::to_string).to_vec(),
+            weights: vec![0.11; MODEL_FEATURE_NAMES.len()],
+            bias: -0.5,
+        };
+        let model_b = TrainedLinearModel {
+            weights: vec![0.99; MODEL_FEATURE_NAMES.len()],
+            bias: 0.5,
+            ..model_a.clone()
+        };
+
+        let (path_a, path_b) = (path.clone(), path.clone());
+        let (model_a2, model_b2) = (model_a.clone(), model_b.clone());
+        let writer_a = std::thread::spawn(move || persist_model(&path_a, &model_a2));
+        let writer_b = std::thread::spawn(move || persist_model(&path_b, &model_b2));
+        writer_a.join().unwrap().expect("writer A should persist");
+        writer_b.join().unwrap().expect("writer B should persist");
+
+        // Whichever rename lands last, the artifact is one writer's complete
+        // model, never a byte-interleaved mix of both.
+        let loaded = asd_detection::load_trained_model(&path)
+            .expect("artifact should be valid after concurrent persists");
+        assert!(loaded.weights == model_a.weights || loaded.weights == model_b.weights);
+        assert!(!any_leftover_temp_files(&path));
+
+        std::fs::remove_file(path).unwrap();
     }
 }

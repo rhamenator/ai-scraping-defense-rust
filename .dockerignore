@@ -1,0 +1,9 @@
+.git
+.agent-channel
+target
+**/target
+.env
+.env.*
+*.log
+.idea
+.vscode

@@ -21,7 +21,7 @@ Important settings:
 
 - `REDIS_HOST`, `REDIS_PORT`: Redis connection used by blocklist and frequency tracking.
 - `POSTGRES_ENABLED`, `PG_HOST`, `PG_PORT`, `PG_DBNAME`, `PG_USER`, `PG_PASSWORD`: PostgreSQL connection used by persisted service state.
-- `AUDIT_STORAGE_BACKEND`: `auto` (default), `postgres`, `jsonl`, or `disabled`. `auto` uses PostgreSQL when connected and initializes a JSONL store at `AUDIT_JSONL_PATH` otherwise. Explicit PostgreSQL selection fails startup if the database is unavailable; invalid backend names also fail startup.
+- `AUDIT_STORAGE_BACKEND`: `auto` (default), `postgres`, `jsonl`, or `disabled`. `auto` uses PostgreSQL when connected and initializes a JSONL store at `AUDIT_JSONL_PATH` otherwise. Explicit PostgreSQL selection fails startup if the database is unavailable; invalid backend names also fail startup. The container image runs from the non-root user's writable home, so its default relative path resolves to `/home/appuser/data/security-events.jsonl`.
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: optional HTTP(S) OTLP/gRPC collector endpoint. When set, all shared-server HTTP spans are batch-exported with W3C `traceparent` extraction and flushed during process shutdown; malformed endpoints fail startup.
 - `ADMIN_API_KEY`, `ESCALATION_API_KEY`, `PUBLIC_BLOCKLIST_API_KEY`, `JWT_SECRET`: API-key and JWT protection for mutation routes.
 - `WEBHOOK_SHARED_SECRET`: HMAC secret for AI service webhooks.
@@ -29,8 +29,13 @@ Important settings:
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
 - `DETECTION_MODEL_PATH`: optional path to a versioned logistic-regression
   artifact emitted by `POST /training/train` on `rag-trainer`. The escalation
-  engine validates and loads it once at startup; an invalid configured artifact
-  fails startup, while an unset path retains the documented heuristic fallback.
+  engine validates and loads it once at startup and again on `POST
+  /admin/reload_model`. An unset path, or a configured path whose file does
+  not exist yet (e.g. a freshly created shared volume before the first
+  persisted training run), retains the documented heuristic fallback; a
+  configured path whose file exists but is malformed or otherwise unreadable
+  fails startup, and `/admin/reload_model` always errors on a missing or
+  invalid artifact rather than silently keeping the previous detector.
 - `MODEL_URI=mcp://primary/classify` plus `MCP_SERVER_PRIMARY_URL`, `MCP_SERVER_PRIMARY_AUTH_TOKEN`, and `MCP_SERVER_PRIMARY_TIMEOUT`: optional MCP model proxying compatible with `request-guard-mcp`. Leave `MODEL_URI` unset to keep MCP disabled.
   The public cloud-proxy strips `tls_ja3`, `tls_ja4`, and
   `tls_fingerprint_source` from MCP payloads because it does not attest the
