@@ -9,7 +9,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opentelemetry::propagation::TextMapPropagator as _;
 use opentelemetry::trace::{
     SpanKind, Status, TraceContextExt as _, Tracer as _, TracerProvider as _,
@@ -18,7 +18,7 @@ use opentelemetry::{Context as OtelContext, KeyValue};
 use opentelemetry_http::HeaderExtractor;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource};
-use redis::{AsyncCommands, ConnectionAddr, ConnectionInfo, RedisConnectionInfo};
+use redis::{AsyncCommands, IntoConnectionInfo, RedisConnectionInfo};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -267,17 +267,21 @@ pub fn redis_client_from_env(
     let host = env_string("REDIS_HOST", "localhost");
     let port = env_u16("REDIS_PORT", 6379);
     let db = env_u16(db_env_var, default_db);
-    redis::Client::open(ConnectionInfo {
-        addr: ConnectionAddr::Tcp(host, port),
-        redis: RedisConnectionInfo {
-            db: i64::from(db),
-            username: env::var("REDIS_USERNAME")
-                .ok()
-                .filter(|value| !value.is_empty()),
-            password: redis_password(),
-            ..RedisConnectionInfo::default()
-        },
-    })
+    let mut redis_settings = RedisConnectionInfo::default().set_db(i64::from(db));
+    if let Some(username) = env::var("REDIS_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        redis_settings = redis_settings.set_username(username);
+    }
+    if let Some(password) = redis_password() {
+        redis_settings = redis_settings.set_password(password);
+    }
+
+    let connection_info = (host, port)
+        .into_connection_info()?
+        .set_redis_settings(redis_settings);
+    redis::Client::open(connection_info)
 }
 
 fn redis_password() -> Option<String> {
