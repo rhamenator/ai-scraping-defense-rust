@@ -68,9 +68,10 @@ async fn get_metrics(
 async fn ws(ws: WebSocketUpgrade, Path(installation_id): Path<String>) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket| async move {
         let _ = socket
-            .send(axum::extract::ws::Message::Text(format!(
-                "{{\"status\":\"connected\",\"installation_id\":\"{installation_id}\"}}"
-            )))
+            .send(axum::extract::ws::Message::Text(
+                format!("{{\"status\":\"connected\",\"installation_id\":\"{installation_id}\"}}")
+                    .into(),
+            ))
             .await;
     })
 }

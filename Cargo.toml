@@ -28,7 +28,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 anyhow = "1"
 aws-lc-rs = "1.18"
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
