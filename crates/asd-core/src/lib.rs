@@ -386,6 +386,13 @@ pub fn verify_hmac_sha256(secret: &str, body: &[u8], signature_hex: &str) -> boo
     constant_time_eq(expected.as_bytes(), signature_hex.as_bytes())
 }
 
+pub fn hmac_sha256_hex(secret: &str, body: &[u8]) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts arbitrary key lengths");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsFingerprint {
     pub ja3: Option<String>,
@@ -645,7 +652,23 @@ pub fn is_authorized(headers: &HeaderMap, api_key_env: &str, jwt_secret_env: &st
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .unwrap_or_default();
-        return verify_hs256_jwt(token, &secret);
+        let Some(claims) = decode_hs256_jwt(token, &secret) else {
+            return false;
+        };
+        let scope_name = format!(
+            "{}_JWT_SCOPE",
+            api_key_env.strip_suffix("_API_KEY").unwrap_or(api_key_env)
+        );
+        let required_scope = env::var(&scope_name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                api_key_env
+                    .strip_suffix("_API_KEY")
+                    .unwrap_or(api_key_env)
+                    .to_ascii_lowercase()
+            });
+        return jwt_has_scope(&claims, &required_scope);
     }
 
     false
@@ -661,6 +684,12 @@ pub fn decode_hs256_jwt(token: &str, secret: &str) -> Option<serde_json::Value> 
     let payload = parts.next()?;
     let signature = parts.next()?;
     if parts.next().is_some() {
+        return None;
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD.decode(header).ok()?;
+    let header_json = serde_json::from_slice::<serde_json::Value>(&header_bytes).ok()?;
+    if header_json.get("alg").and_then(|value| value.as_str()) != Some("HS256") {
         return None;
     }
 
@@ -680,12 +709,56 @@ pub fn decode_hs256_jwt(token: &str, secret: &str) -> Option<serde_json::Value> 
     let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
         return None;
     };
-    if let Some(exp) = payload_json.get("exp").and_then(|value| value.as_i64()) {
-        if Utc::now().timestamp() >= exp {
+    let now = Utc::now().timestamp();
+    let leeway = env_u64("JWT_CLOCK_SKEW_SECONDS", 60) as i64;
+    let exp = payload_json.get("exp")?.as_i64()?;
+    let iat = payload_json.get("iat")?.as_i64()?;
+    if now.saturating_sub(leeway) >= exp || iat > now.saturating_add(leeway) {
+        return None;
+    }
+    if payload_json
+        .get("nbf")
+        .and_then(|value| value.as_i64())
+        .is_some_and(|nbf| nbf > now.saturating_add(leeway))
+    {
+        return None;
+    }
+    if let Ok(expected) = env::var("JWT_ISSUER") {
+        if !expected.trim().is_empty()
+            && payload_json.get("iss").and_then(|value| value.as_str()) != Some(expected.as_str())
+        {
+            return None;
+        }
+    }
+    if let Ok(expected) = env::var("JWT_AUDIENCE") {
+        if !expected.trim().is_empty() && !jwt_audience_matches(&payload_json, &expected) {
             return None;
         }
     }
     Some(payload_json)
+}
+
+fn jwt_audience_matches(claims: &serde_json::Value, expected: &str) -> bool {
+    match claims.get("aud") {
+        Some(serde_json::Value::String(value)) => value == expected,
+        Some(serde_json::Value::Array(values)) => {
+            values.iter().any(|value| value.as_str() == Some(expected))
+        }
+        _ => false,
+    }
+}
+
+fn jwt_has_scope(claims: &serde_json::Value, required: &str) -> bool {
+    let claim = claims.get("scope").or_else(|| claims.get("scp"));
+    match claim {
+        Some(serde_json::Value::String(scopes)) => {
+            scopes.split_whitespace().any(|scope| scope == required)
+        }
+        Some(serde_json::Value::Array(scopes)) => {
+            scopes.iter().any(|scope| scope.as_str() == Some(required))
+        }
+        _ => false,
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -951,7 +1024,16 @@ pub async fn pg_connect_from_env() -> Option<PgClient> {
     let port = env_u16("PG_PORT", 5432);
     let db = env_string("PG_DBNAME", "markovdb");
     let user = env_string("PG_USER", "markovuser");
-    let password = pg_password().unwrap_or_else(|| env_string("PG_PASSWORD", "markovpass"));
+    let Some(password) = pg_password().or_else(|| {
+        env::var("PG_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }) else {
+        tracing::error!(
+            "PostgreSQL is enabled but PG_PASSWORD/PG_PASSWORD_FILE is not configured; run scripts/configure_credentials.py"
+        );
+        return None;
+    };
     let mut config = tokio_postgres::Config::new();
     config
         .host(&host)
@@ -1204,7 +1286,8 @@ mod tests {
     #[test]
     fn hs256_jwt_decodes_verified_claims() {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"admin","roles":["ops"],"exp":4102444800}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"admin","roles":["ops"],"iat":1700000000,"exp":4102444800}"#);
         let signing_input = format!("{header}.{payload}");
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
         mac.update(signing_input.as_bytes());

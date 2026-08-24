@@ -50,14 +50,18 @@ async fn webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if let Some(secret) = &state.config.webhook_shared_secret {
-        let signature = headers
-            .get("x-signature")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !verify_hmac_sha256(secret, &body, signature) {
-            return Err(error(StatusCode::UNAUTHORIZED, "Unauthorized"));
-        }
+    let Some(secret) = &state.config.webhook_shared_secret else {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WEBHOOK_SHARED_SECRET is not configured; run scripts/configure_credentials.py",
+        ));
+    };
+    let signature = headers
+        .get("x-signature")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !verify_hmac_sha256(secret, &body, signature) {
+        return Err(error(StatusCode::UNAUTHORIZED, "Unauthorized"));
     }
     let action: WebhookAction = serde_json::from_slice(&body)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid payload"))?;
@@ -153,18 +157,34 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_and_incomplete_payloads_fail_closed() {
+        let malformed_body = Bytes::from_static(b"not-json");
+        let mut malformed_headers = HeaderMap::new();
+        malformed_headers.insert(
+            "x-signature",
+            asd_core::hmac_sha256_hex("test-webhook-secret", &malformed_body)
+                .parse()
+                .unwrap(),
+        );
         let malformed = webhook(
-            State(state(None)),
-            HeaderMap::new(),
-            Bytes::from_static(b"not-json"),
+            State(state(Some("test-webhook-secret"))),
+            malformed_headers,
+            malformed_body,
         )
         .await;
         assert!(matches!(malformed, Err((StatusCode::BAD_REQUEST, _))));
 
+        let missing_ip_body = Bytes::from_static(br#"{"action":"block_ip"}"#);
+        let mut missing_ip_headers = HeaderMap::new();
+        missing_ip_headers.insert(
+            "x-signature",
+            asd_core::hmac_sha256_hex("test-webhook-secret", &missing_ip_body)
+                .parse()
+                .unwrap(),
+        );
         let missing_ip = webhook(
-            State(state(None)),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"action":"block_ip"}"#),
+            State(state(Some("test-webhook-secret"))),
+            missing_ip_headers,
+            missing_ip_body,
         )
         .await;
         assert!(matches!(missing_ip, Err((StatusCode::BAD_REQUEST, _))));
@@ -172,36 +192,35 @@ mod tests {
 
     #[tokio::test]
     async fn block_and_allow_actions_change_blocklist_state() {
-        let state = state(None);
+        let state = state(Some("test-webhook-secret"));
         let ip = "198.51.100.12";
-        let _ = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from(format!(r#"{{"action":"block_ip","ip":"{ip}"}}"#)),
-        )
-        .await
-        .expect("block action should succeed");
+        let body = Bytes::from(format!(r#"{{"action":"block_ip","ip":"{ip}"}}"#));
+        let signature = asd_core::hmac_sha256_hex("test-webhook-secret", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-signature", signature.parse().unwrap());
+        let _ = webhook(State(state.clone()), headers, body)
+            .await
+            .expect("block action should succeed");
         assert!(state.blocklist.contains(ip).await);
 
-        let _ = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from(format!(r#"{{"action":"allow_ip","ip":"{ip}"}}"#)),
-        )
-        .await
-        .expect("allow action should succeed");
+        let body = Bytes::from(format!(r#"{{"action":"allow_ip","ip":"{ip}"}}"#));
+        let signature = asd_core::hmac_sha256_hex("test-webhook-secret", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-signature", signature.parse().unwrap());
+        let _ = webhook(State(state.clone()), headers, body)
+            .await
+            .expect("allow action should succeed");
         assert!(!state.blocklist.contains(ip).await);
     }
 
     #[tokio::test]
     async fn invalid_ip_is_never_added_to_blocklist() {
-        let state = state(None);
-        let result = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"action":"block_ip","ip":"not-an-ip"}"#),
-        )
-        .await;
+        let state = state(Some("test-webhook-secret"));
+        let body = Bytes::from_static(br#"{"action":"block_ip","ip":"not-an-ip"}"#);
+        let signature = asd_core::hmac_sha256_hex("test-webhook-secret", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-signature", signature.parse().unwrap());
+        let result = webhook(State(state.clone()), headers, body).await;
 
         assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
         assert!(state.blocklist.blocked().await.is_empty());
