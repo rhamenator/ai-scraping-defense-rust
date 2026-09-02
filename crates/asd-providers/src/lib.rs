@@ -254,6 +254,10 @@ impl ModelProvider {
         let request = sanitize_mcp_payload(request);
         let operation_timeout = Duration::from_secs((*timeout_secs).max(1));
         let mut ws_request = self.endpoint.as_str().into_client_request()?;
+        ws_request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+            "mcp".parse()?,
+        );
         if let Some(api_key) = &self.api_key {
             ws_request
                 .headers_mut()
@@ -261,12 +265,61 @@ impl ModelProvider {
         }
 
         let (mut socket, _) = timeout(operation_timeout, connect_async(ws_request)).await??;
+        let initialize_id = json_rpc_id();
+        let initialize_request = json!({
+            "jsonrpc": "2.0",
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "ai-scraping-defense-rust",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+        timeout(
+            operation_timeout,
+            futures_util::SinkExt::send(
+                &mut socket,
+                Message::Text(initialize_request.to_string().into()),
+            ),
+        )
+        .await??;
+        let initialize_response = timeout(
+            operation_timeout,
+            futures_util::StreamExt::next(&mut socket),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("MCP server closed during initialization"))??;
+        let initialize_response = parse_mcp_message(initialize_response)?;
+        if let Some(error) = initialize_response.get("error") {
+            anyhow::bail!("MCP initialization error: {error}");
+        }
+
+        let initialized_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        timeout(
+            operation_timeout,
+            futures_util::SinkExt::send(
+                &mut socket,
+                Message::Text(initialized_notification.to_string().into()),
+            ),
+        )
+        .await??;
+
         let rpc_id = json_rpc_id();
         let rpc_request = json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
-            "method": tool_name,
-            "params": request
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": request
+            }
         });
 
         timeout(
@@ -282,14 +335,22 @@ impl ModelProvider {
         .await?
         .ok_or_else(|| anyhow::anyhow!("MCP server closed before sending a response"))??;
 
-        let response_text = match message {
-            Message::Text(text) => text.to_string(),
-            Message::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
-            other => anyhow::bail!("unexpected MCP websocket response: {other:?}"),
-        };
-        let response: serde_json::Value = serde_json::from_str(&response_text)?;
+        let response = parse_mcp_message(message)?;
+        let _ = timeout(operation_timeout, futures_util::SinkExt::close(&mut socket)).await;
         if let Some(error) = response.get("error") {
             anyhow::bail!("MCP tool error: {error}");
+        }
+        if response
+            .pointer("/result/isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let diagnostic = response
+                .pointer("/result/content")
+                .cloned()
+                .or_else(|| response.get("result").cloned())
+                .unwrap_or(response);
+            anyhow::bail!("MCP tool error: {diagnostic}");
         }
 
         Ok(json!({
@@ -298,9 +359,22 @@ impl ModelProvider {
             "server": server_label,
             "tool": tool_name,
             "upstream_status": 200,
-            "response": response.get("result").cloned().unwrap_or(response)
+            "response": response
+                .pointer("/result/structuredContent")
+                .cloned()
+                .or_else(|| response.get("result").cloned())
+                .unwrap_or(response)
         }))
     }
+}
+
+fn parse_mcp_message(message: Message) -> anyhow::Result<serde_json::Value> {
+    let response_text = match message {
+        Message::Text(text) => text.to_string(),
+        Message::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
+        other => anyhow::bail!("unexpected MCP websocket response: {other:?}"),
+    };
+    Ok(serde_json::from_str(&response_text)?)
 }
 
 impl ProviderKind {
