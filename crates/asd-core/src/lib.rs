@@ -126,6 +126,7 @@ impl BlocklistState {
             tracing::warn!(ip = %ip, "refusing to block an invalid or trusted infrastructure IP");
             return false;
         }
+        let ip = normalize_client_ip(&ip).expect("validated IP address");
         self.blocked.write().await.insert(ip.clone());
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
@@ -139,10 +140,13 @@ impl BlocklistState {
     }
 
     pub async fn allow(&self, ip: &str) {
-        self.blocked.write().await.remove(ip);
+        let Some(ip) = normalize_client_ip(ip) else {
+            return;
+        };
+        self.blocked.write().await.remove(&ip);
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<usize> = con.srem(&self.blocklist_key, ip).await;
+                let result: redis::RedisResult<usize> = con.srem(&self.blocklist_key, &ip).await;
                 if let Err(exc) = result {
                     tracing::warn!(error = %exc, ip, "failed to remove block from Redis; in-memory block was removed");
                 }
@@ -152,6 +156,10 @@ impl BlocklistState {
 
     pub async fn flag(&self, ip: impl Into<String>, reason: impl Into<String>) {
         let ip = ip.into();
+        let Some(ip) = normalize_client_ip(&ip) else {
+            tracing::warn!(ip = %ip, "refusing to flag an invalid IP");
+            return;
+        };
         let reason = reason.into();
         self.flagged
             .write()
@@ -170,7 +178,10 @@ impl BlocklistState {
     }
 
     pub async fn unflag(&self, ip: &str) {
-        self.flagged.write().await.remove(ip);
+        let Some(ip) = normalize_client_ip(ip) else {
+            return;
+        };
+        self.flagged.write().await.remove(&ip);
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                 let result: redis::RedisResult<usize> =
@@ -183,26 +194,30 @@ impl BlocklistState {
     }
 
     pub async fn contains(&self, ip: &str) -> bool {
-        if self.blocked.read().await.contains(ip) {
+        let Some(ip) = normalize_client_ip(ip) else {
+            return false;
+        };
+        if self.blocked.read().await.contains(&ip) {
             if let Some(client) = &self.redis {
                 if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                    let _: redis::RedisResult<usize> = con.sadd(&self.blocklist_key, ip).await;
+                    let _: redis::RedisResult<usize> = con.sadd(&self.blocklist_key, &ip).await;
                 }
             }
             return true;
         }
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<bool> = con.sismember(&self.blocklist_key, ip).await;
+                let result: redis::RedisResult<bool> =
+                    con.sismember(&self.blocklist_key, &ip).await;
                 if let Ok(value) = result {
                     if value {
-                        self.blocked.write().await.insert(ip.to_string());
+                        self.blocked.write().await.insert(ip.clone());
                     }
                     return value;
                 }
             }
         }
-        self.blocked.read().await.contains(ip)
+        self.blocked.read().await.contains(&ip)
     }
 
     pub async fn blocked(&self) -> Vec<String> {
@@ -880,9 +895,12 @@ pub fn metrics_text(service: &str, counters: &[(&str, u64)]) -> impl IntoRespons
 }
 
 pub fn is_blockable_client_ip(candidate: &str) -> bool {
-    let Ok(ip) = candidate.parse::<std::net::IpAddr>() else {
+    let Some(normalized) = normalize_client_ip(candidate) else {
         return false;
     };
+    let ip = normalized
+        .parse::<std::net::IpAddr>()
+        .expect("normalized IP");
     !ip_in_configured_ranges(
         ip,
         &[
@@ -890,6 +908,17 @@ pub fn is_blockable_client_ip(candidate: &str) -> bool {
             "SECURITY_TRUSTED_PROXY_CIDRS",
         ],
     )
+}
+
+fn normalize_client_ip(candidate: &str) -> Option<String> {
+    let ip = candidate.parse::<std::net::IpAddr>().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.to_string())
+            .unwrap_or_else(|| ip.to_string()),
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+    })
 }
 
 fn ip_in_configured_ranges(candidate: std::net::IpAddr, names: &[&str]) -> bool {
@@ -1200,6 +1229,31 @@ pub struct IpAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blocklist_uses_canonical_ip_addresses() {
+        let state = BlocklistState::default();
+        assert!(state.block("2001:0db8:0000:0000::1").await);
+        assert!(state.contains("2001:db8::1").await);
+        assert_eq!(state.blocked().await, vec!["2001:db8::1"]);
+        state.allow("2001:0db8::1").await;
+        assert!(!state.contains("2001:db8::1").await);
+
+        assert!(state.block("::ffff:198.51.100.7").await);
+        assert!(state.contains("198.51.100.7").await);
+        state.allow("198.51.100.7").await;
+        assert!(!state.contains("::ffff:198.51.100.7").await);
+
+        state.flag("2001:0db8::1", "probe").await;
+        assert_eq!(
+            state.flagged.read().await.get("2001:db8::1"),
+            Some(&"probe".to_string())
+        );
+        state.unflag("2001:db8::1").await;
+        assert!(state.flagged.read().await.is_empty());
+        state.flag("not-an-ip", "probe").await;
+        assert!(state.flagged.read().await.is_empty());
+    }
 
     #[test]
     fn hs256_jwt_decodes_verified_claims() {
