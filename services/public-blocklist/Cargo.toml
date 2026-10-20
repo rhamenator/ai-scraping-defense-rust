@@ -13,3 +13,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
