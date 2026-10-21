@@ -86,7 +86,7 @@ pub struct BlocklistState {
 }
 
 impl BlocklistState {
-    pub async fn from_env() -> Self {
+    pub async fn from_env() -> anyhow::Result<Self> {
         let mut state = Self {
             blocklist_key: tenant_key("blocklist"),
             flag_prefix: tenant_key("ip_flag:"),
@@ -96,7 +96,7 @@ impl BlocklistState {
             .map(|value| value.eq_ignore_ascii_case("false"))
             .unwrap_or(false)
         {
-            return state;
+            return Ok(state);
         }
 
         match redis_client_from_env("REDIS_DB_BLOCKLIST", 0) {
@@ -105,6 +105,7 @@ impl BlocklistState {
                     let ping: redis::RedisResult<String> =
                         redis::cmd("PING").query_async(&mut con).await;
                     if ping.is_ok() {
+                        state.migrate_legacy_blocklist(&mut con).await?;
                         tracing::info!("connected to Redis-backed blocklist store");
                         state.redis = Some(client);
                     }
@@ -117,7 +118,36 @@ impl BlocklistState {
                 tracing::warn!(error = %exc, "Redis config invalid; using in-memory blocklist store")
             }
         }
-        state
+        Ok(state)
+    }
+
+    async fn migrate_legacy_blocklist(
+        &self,
+        con: &mut redis::aio::MultiplexedConnection,
+    ) -> anyhow::Result<()> {
+        let entries: Vec<String> = con.smembers(&self.blocklist_key).await?;
+        let (migrations, invalid) = blocklist_migration_plan(entries);
+        for ip in invalid {
+            tracing::warn!(ip = %ip, "invalid persisted blocklist entry left unchanged");
+        }
+        let mut migrated = 0usize;
+        for (legacy, canonical) in migrations {
+            let _: (usize, usize) = redis::pipe()
+                .atomic()
+                .cmd("SADD")
+                .arg(&self.blocklist_key)
+                .arg(&canonical)
+                .cmd("SREM")
+                .arg(&self.blocklist_key)
+                .arg(&legacy)
+                .query_async(con)
+                .await?;
+            migrated += 1;
+        }
+        if migrated > 0 {
+            tracing::info!(migrated, "canonicalized persisted blocklist entries");
+        }
+        Ok(())
     }
 
     pub async fn block(&self, ip: impl Into<String>) -> bool {
@@ -154,11 +184,11 @@ impl BlocklistState {
         }
     }
 
-    pub async fn flag(&self, ip: impl Into<String>, reason: impl Into<String>) {
+    pub async fn flag(&self, ip: impl Into<String>, reason: impl Into<String>) -> bool {
         let ip = ip.into();
         let Some(ip) = normalize_client_ip(&ip) else {
             tracing::warn!(ip = %ip, "refusing to flag an invalid IP");
-            return;
+            return false;
         };
         let reason = reason.into();
         self.flagged
@@ -175,6 +205,7 @@ impl BlocklistState {
                 }
             }
         }
+        true
     }
 
     pub async fn unflag(&self, ip: &str) {
@@ -912,13 +943,30 @@ pub fn is_blockable_client_ip(candidate: &str) -> bool {
 
 fn normalize_client_ip(candidate: &str) -> Option<String> {
     let ip = candidate.parse::<std::net::IpAddr>().ok()?;
-    Some(match ip {
+    Some(canonical_ip_addr(ip).to_string())
+}
+
+fn blocklist_migration_plan(entries: Vec<String>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut migrations = Vec::new();
+    let mut invalid = Vec::new();
+    for legacy in entries {
+        match normalize_client_ip(&legacy) {
+            Some(canonical) if canonical != legacy => migrations.push((legacy, canonical)),
+            None => invalid.push(legacy),
+            _ => {}
+        }
+    }
+    (migrations, invalid)
+}
+
+fn canonical_ip_addr(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
         std::net::IpAddr::V6(ip) => ip
             .to_ipv4_mapped()
-            .map(|mapped| mapped.to_string())
-            .unwrap_or_else(|| ip.to_string()),
-        std::net::IpAddr::V4(ip) => ip.to_string(),
-    })
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(ip)),
+        ip => ip,
+    }
 }
 
 fn ip_in_configured_ranges(candidate: std::net::IpAddr, names: &[&str]) -> bool {
@@ -939,15 +987,25 @@ fn ip_in_configured_ranges(candidate: std::net::IpAddr, names: &[&str]) -> bool 
 }
 
 fn ip_in_cidr(candidate: std::net::IpAddr, cidr: &str) -> bool {
+    let candidate = canonical_ip_addr(candidate);
     let Some((address, prefix)) = cidr.split_once('/') else {
-        return candidate.to_string() == cidr;
+        return cidr
+            .parse::<std::net::IpAddr>()
+            .map(|network| candidate == canonical_ip_addr(network))
+            .unwrap_or(false);
     };
-    let Ok(network) = address.parse::<std::net::IpAddr>() else {
+    let Ok(mut network) = address.parse::<std::net::IpAddr>() else {
         return false;
     };
-    let Ok(prefix) = prefix.parse::<u32>() else {
+    let Ok(mut prefix) = prefix.parse::<u32>() else {
         return false;
     };
+    if let (std::net::IpAddr::V4(_), std::net::IpAddr::V6(v6)) = (candidate, network) {
+        if let Some(mapped) = v6.to_ipv4_mapped() {
+            network = std::net::IpAddr::V4(mapped);
+            prefix = prefix.saturating_sub(96);
+        }
+    }
     match (candidate, network) {
         (std::net::IpAddr::V4(candidate), std::net::IpAddr::V4(network)) if prefix <= 32 => {
             let mask = if prefix == 0 {
@@ -1244,15 +1302,46 @@ mod tests {
         state.allow("198.51.100.7").await;
         assert!(!state.contains("::ffff:198.51.100.7").await);
 
-        state.flag("2001:0db8::1", "probe").await;
+        assert!(state.flag("2001:0db8::1", "probe").await);
         assert_eq!(
             state.flagged.read().await.get("2001:db8::1"),
             Some(&"probe".to_string())
         );
         state.unflag("2001:db8::1").await;
         assert!(state.flagged.read().await.is_empty());
-        state.flag("not-an-ip", "probe").await;
+        assert!(!state.flag("not-an-ip", "probe").await);
         assert!(state.flagged.read().await.is_empty());
+    }
+
+    #[test]
+    fn mapped_trusted_cidrs_keep_their_ipv4_scope() {
+        let mapped = "::ffff:10.2.0.0/112";
+        assert!(ip_in_cidr("10.2.3.4".parse().unwrap(), mapped));
+        assert!(ip_in_cidr("::ffff:10.2.3.4".parse().unwrap(), mapped));
+        assert!(!ip_in_cidr("10.3.3.4".parse().unwrap(), mapped));
+        assert!(ip_in_cidr("10.2.3.4".parse().unwrap(), "::ffff:10.2.3.4"));
+        assert!(ip_in_cidr(
+            "192.0.2.1".parse().unwrap(),
+            "::ffff:0.0.0.0/96"
+        ));
+    }
+
+    #[test]
+    fn legacy_blocklist_entries_are_planned_for_migration() {
+        let (migrations, invalid) = blocklist_migration_plan(vec![
+            "2001:0db8::1".into(),
+            "::ffff:198.51.100.7".into(),
+            "2001:db8::2".into(),
+            "not-an-ip".into(),
+        ]);
+        assert_eq!(
+            migrations,
+            vec![
+                ("2001:0db8::1".into(), "2001:db8::1".into()),
+                ("::ffff:198.51.100.7".into(), "198.51.100.7".into())
+            ]
+        );
+        assert_eq!(invalid, vec!["not-an-ip"]);
     }
 
     #[test]

@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env("public-blocklist", 8011);
     let pg = pg_connect_from_env().await.map(Arc::new);
     let state = AppState {
-        blocklist: BlocklistState::from_env().await,
+        blocklist: BlocklistState::from_env().await?,
         audit: AuditStore::from_env(pg).await?,
     };
     let app = Router::new()
