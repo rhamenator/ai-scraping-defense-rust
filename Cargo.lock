@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "admin-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "ai-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -74,7 +74,7 @@ checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
 name = "asd-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "asd-detection"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "asd-providers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "asd-tarpit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "rand 0.10.2",
@@ -402,7 +402,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "captcha-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "cloud-dashboard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "cloud-proxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "config-recommender"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -665,7 +665,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edge-ops"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "escalation-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -1658,7 +1658,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pay-per-crawl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-router"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "public-blocklist"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -1947,7 +1947,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rag-trainer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "tarpit-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "asd-core",
