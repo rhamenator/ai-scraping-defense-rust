@@ -16,5 +16,7 @@
 
 ### Security
 
+- Require the configured API key on public blocklist reports and reject
+  malformed report content (GHSA-vgfc-ffwp-vv38).
 - Review and dismiss deterministic test-only key findings with documented
   rationale.

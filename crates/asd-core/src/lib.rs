@@ -676,11 +676,7 @@ pub fn is_authorized(headers: &HeaderMap, api_key_env: &str, jwt_secret_env: &st
     }
 
     if let Some(expected) = expected_api_key {
-        let provided = headers
-            .get("x-api-key")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+        if has_valid_api_key(headers, &expected) {
             return true;
         }
     }
@@ -695,6 +691,16 @@ pub fn is_authorized(headers: &HeaderMap, api_key_env: &str, jwt_secret_env: &st
     }
 
     false
+}
+
+pub fn has_valid_api_key(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(provided) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    constant_time_eq(expected.as_bytes(), provided.as_bytes())
 }
 
 pub fn verify_hs256_jwt(token: &str, secret: &str) -> bool {

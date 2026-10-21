@@ -1,15 +1,17 @@
 use asd_core::{
-    health, is_authorized, observability_router, pg_connect_from_env, record_security_event, serve,
-    AuditStore, BlocklistState, IpAction, ServiceConfig,
+    has_valid_api_key, health, is_authorized, observability_router, pg_connect_from_env,
+    record_security_event, serve, AuditStore, BlocklistState, IpAction, ServiceConfig,
 };
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{env, net::IpAddr, sync::Arc};
 
 #[derive(Clone)]
 struct AppState {
@@ -33,7 +35,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/list", get(list))
         .route("/list/auth", get(list_auth))
-        .route("/report", post(report))
+        .route(
+            "/report",
+            post(report).route_layer(middleware::from_fn(require_report_key)),
+        )
         .merge(observability_router("public-blocklist"))
         .with_state(state);
     serve(app, config).await
@@ -56,9 +61,13 @@ async fn list_auth(
 async fn report(
     State(state): State<AppState>,
     Json(action): Json<IpAction>,
-) -> Json<serde_json::Value> {
-    if let Some(ip) = action.ip {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(ip) = action.ip.and_then(|ip| ip.parse::<IpAddr>().ok()) {
         let reason = action.reason.unwrap_or_else(|| "community_report".into());
+        if reason.is_empty() || reason.len() > 256 {
+            return Err(bad_request("reason must be 1 to 256 bytes"));
+        }
+        let ip = ip.to_string();
         state.blocklist.flag(ip.clone(), reason.clone()).await;
         record_security_event(
             &state.audit,
@@ -67,10 +76,38 @@ async fn report(
             json!({"ip":ip,"reason":reason}),
         )
         .await;
-        Json(json!({"status":"accepted","ip":ip}))
+        Ok(Json(json!({"status":"accepted","ip":ip})))
     } else {
-        Json(json!({"status":"error","message":"ip required"}))
+        Err(bad_request("valid IP required"))
     }
+}
+
+async fn require_report_key(request: Request, next: Next) -> Response {
+    let Ok(expected) = env::var("PUBLIC_BLOCKLIST_API_KEY") else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"error","message":"API key not configured"})),
+        )
+            .into_response();
+    };
+    if expected.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"error","message":"API key not configured"})),
+        )
+            .into_response();
+    }
+    if !has_valid_api_key(request.headers(), &expected) {
+        return unauthorized().into_response();
+    }
+    next.run(request).await
+}
+
+fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"status":"error","message":message})),
+    )
 }
 
 fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
@@ -78,4 +115,104 @@ fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::UNAUTHORIZED,
         Json(json!({"status":"error","message":"Unauthorized"})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn report_requires_key_before_parsing_and_validates_content() {
+        env::set_var("PUBLIC_BLOCKLIST_API_KEY", "test-only-secret");
+        let state = AppState {
+            blocklist: BlocklistState::default(),
+            audit: AuditStore::Disabled,
+        };
+        let app = Router::new()
+            .route(
+                "/report",
+                post(report).route_layer(middleware::from_fn(require_report_key)),
+            )
+            .with_state(state.clone());
+
+        for (key, body, expected) in [
+            (None, "not-json", StatusCode::UNAUTHORIZED),
+            (Some("wrong"), "{}", StatusCode::UNAUTHORIZED),
+            (
+                Some("test-only-secret"),
+                "not-json",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("test-only-secret"),
+                "{\"ip\":\"bad-ip\"}",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut request = Request::builder().method("POST").uri("/report");
+            if let Some(key) = key {
+                request = request.header("x-api-key", key);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(state.blocklist.stats().await.flagged_count, 0);
+
+        let too_long = json!({"ip":"198.51.100.23","reason":"x".repeat(257)});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/report")
+                    .header("x-api-key", "test-only-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(too_long.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.blocklist.stats().await.flagged_count, 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/report")
+                    .header("x-api-key", "test-only-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip":"198.51.100.23","reason":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.blocklist.stats().await.flagged_count, 1);
+
+        env::remove_var("PUBLIC_BLOCKLIST_API_KEY");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/report")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
