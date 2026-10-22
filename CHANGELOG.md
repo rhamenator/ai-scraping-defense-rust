@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-22
+
+### Fixed
+
+- Restored native release bundle publication by providing the required
+  CAPTCHA token secret during the packaged service smoke test.
+
 ## [0.1.2] - 2026-10-22
 
 ### Security
