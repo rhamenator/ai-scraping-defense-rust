@@ -57,6 +57,9 @@ def main() -> None:
         shutil.copy2(source, stage / source.name)
 
     shutil.copy2("README.md", stage / "README.md")
+    logo = stage / ".github" / "assets" / "logo.png"
+    logo.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(".github/assets/logo.png", logo)
     shutil.copy2("docs/USAGE.md", stage / "USAGE.md")
     shutil.copy2("config/sample.env", stage / "sample.env")
     shutil.copy2("Cargo.lock", stage / "Cargo.lock")
