@@ -64,6 +64,13 @@ async fn report(
     Json(action): Json<IpAction>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if let Some(ip) = action.ip.and_then(|ip| ip.parse::<IpAddr>().ok()) {
+        if !is_reportable_ip(ip) {
+            return Err(bad_request("public client IP required"));
+        }
+        let ip = match ip {
+            IpAddr::V6(ip) => ip.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip)),
+            ip => ip,
+        };
         if !is_reportable_ip(ip) || !is_blockable_client_ip(&ip.to_string()) {
             return Err(bad_request("public client IP required"));
         }
@@ -195,7 +202,16 @@ mod tests {
         }
         assert_eq!(state.blocklist.stats().await.flagged_count, 0);
 
-        for ip in ["127.0.0.1", "10.0.0.1", "::1", "fe80::1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::1",
+            "fe80::1",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -244,6 +260,24 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(state.blocklist.stats().await.flagged_count, 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/report")
+                    .header("x-api-key", "test-only-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"ip":"::ffff:198.51.100.24","reason":"test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.blocklist.stats().await.flagged_count, 2);
 
         env::remove_var("PUBLIC_BLOCKLIST_API_KEY");
         let response = app
