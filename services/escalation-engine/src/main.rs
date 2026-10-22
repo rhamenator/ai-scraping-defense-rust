@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: config.clone(),
         frequency: FrequencyStore::from_env().await,
-        blocklist: BlocklistState::from_env().await,
+        blocklist: BlocklistState::from_env().await?,
         audit: AuditStore::from_env(pg).await?,
         model: Arc::new(std::sync::RwLock::new(model)),
         model_path,

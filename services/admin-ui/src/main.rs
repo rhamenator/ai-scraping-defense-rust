@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let passkeys = Arc::new(webauthn::PasskeyService::from_env()?);
     let state = AppState {
         config: config.clone(),
-        blocklist: BlocklistState::from_env().await,
+        blocklist: BlocklistState::from_env().await?,
         pg,
         audit,
         oidc,

@@ -1,6 +1,6 @@
 [package]
 name = "public-blocklist"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
