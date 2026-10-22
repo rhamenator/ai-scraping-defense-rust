@@ -340,6 +340,18 @@ impl ModelProvider {
         if let Some(error) = response.get("error") {
             anyhow::bail!("MCP tool error: {error}");
         }
+        if response
+            .pointer("/result/isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let diagnostic = response
+                .pointer("/result/content")
+                .cloned()
+                .or_else(|| response.get("result").cloned())
+                .unwrap_or(response);
+            anyhow::bail!("MCP tool error: {diagnostic}");
+        }
 
         Ok(json!({
             "status": "success",
