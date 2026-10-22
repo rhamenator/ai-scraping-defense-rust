@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-22
+
+### Security
+
+- Escaped tarpit request paths in HTML, rejected client-asserted verified bot
+  identity, and normalized encoded sensitive paths during scoring.
+- Bounded CAPTCHA state and public MFA attempts, made TOTP verification
+  read-only for unknown users, and rejected local or trusted addresses in
+  authenticated public blocklist reports, including IPv4-compatible forms.
+
+### Changed
+
+- Updated Rust dependencies and pinned GitHub Actions; the locked rustls
+  dependency includes fixes for the reported RustSec advisories.
+- Hardened service configuration, credentials, authentication, error handling,
+  and MCP WebSocket response validation.
+
 ## [0.1.1] - 2026-10-21
 
 ### Fixed
