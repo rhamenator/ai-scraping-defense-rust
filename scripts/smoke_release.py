@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import subprocess
 import tarfile
 import tempfile
@@ -56,21 +57,27 @@ def main() -> None:
                 "POSTGRES_ENABLED": "false",
                 "REDIS_ENABLED": "false",
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+                "CAPTCHA_TOKEN_SECRET": secrets.token_hex(32),
             }
         )
+        service_log = tempfile.TemporaryFile()
         process = subprocess.Popen(
             [str(matches[0])],
             cwd=matches[0].parent,
             env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=service_log,
+            stderr=subprocess.STDOUT,
         )
         try:
             deadline = time.monotonic() + 20
             url = f"http://127.0.0.1:{args.port}/health"
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    raise RuntimeError(f"packaged service exited with {process.returncode}")
+                    service_log.seek(0)
+                    output = service_log.read().decode("utf-8", errors="replace")[-4000:]
+                    raise RuntimeError(
+                        f"packaged service exited with {process.returncode}:\n{output}"
+                    )
                 try:
                     with urllib.request.urlopen(url, timeout=1) as response:
                         if response.status == 200:
@@ -85,6 +92,7 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+            service_log.close()
 
 
 if __name__ == "__main__":
