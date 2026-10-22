@@ -287,13 +287,8 @@ impl ModelProvider {
             ),
         )
         .await??;
-        let initialize_response = timeout(
-            operation_timeout,
-            futures_util::StreamExt::next(&mut socket),
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("MCP server closed during initialization"))??;
-        let initialize_response = parse_mcp_message(initialize_response)?;
+        let initialize_response =
+            receive_mcp_response(&mut socket, &initialize_id, operation_timeout).await?;
         if let Some(error) = initialize_response.get("error") {
             anyhow::bail!("MCP initialization error: {error}");
         }
@@ -328,14 +323,7 @@ impl ModelProvider {
         )
         .await??;
 
-        let message = timeout(
-            operation_timeout,
-            futures_util::StreamExt::next(&mut socket),
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("MCP server closed before sending a response"))??;
-
-        let response = parse_mcp_message(message)?;
+        let response = receive_mcp_response(&mut socket, &rpc_id, operation_timeout).await?;
         let _ = timeout(operation_timeout, futures_util::SinkExt::close(&mut socket)).await;
         if let Some(error) = response.get("error") {
             anyhow::bail!("MCP tool error: {error}");
@@ -375,6 +363,43 @@ fn parse_mcp_message(message: Message) -> anyhow::Result<serde_json::Value> {
         other => anyhow::bail!("unexpected MCP websocket response: {other:?}"),
     };
     Ok(serde_json::from_str(&response_text)?)
+}
+
+async fn receive_mcp_response(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    expected_id: &str,
+    operation_timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    timeout(operation_timeout, async {
+        loop {
+            let message = futures_util::StreamExt::next(socket)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("MCP server closed before sending a response"))??;
+            if let Some(response) = matching_mcp_response(parse_mcp_message(message)?, expected_id)?
+            {
+                return Ok::<_, anyhow::Error>(response);
+            }
+        }
+    })
+    .await?
+}
+
+fn matching_mcp_response(
+    response: serde_json::Value,
+    expected_id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if response.get("method").is_some() && response.get("id").is_none() {
+        return Ok(None);
+    }
+    if response.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+        || response.get("id").and_then(serde_json::Value::as_str) != Some(expected_id)
+        || (response.get("result").is_none() && response.get("error").is_none())
+    {
+        anyhow::bail!("unexpected MCP JSON-RPC response");
+    }
+    Ok(Some(response))
 }
 
 impl ProviderKind {
@@ -503,6 +528,30 @@ fn sanitize_mcp_payload(mut request: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_response_requires_matching_id_and_result() {
+        assert!(matching_mcp_response(
+            json!({"jsonrpc":"2.0","method":"notifications/progress"}),
+            "expected"
+        )
+        .unwrap()
+        .is_none());
+        assert!(matching_mcp_response(
+            json!({"jsonrpc":"2.0","id":"other","result":{}}),
+            "expected"
+        )
+        .is_err());
+        assert!(
+            matching_mcp_response(json!({"jsonrpc":"2.0","id":"expected"}), "expected").is_err()
+        );
+        assert!(matching_mcp_response(
+            json!({"jsonrpc":"2.0","id":"expected","result":{}}),
+            "expected"
+        )
+        .unwrap()
+        .is_some());
+    }
 
     #[test]
     fn parses_mcp_model_uri() {
