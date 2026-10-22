@@ -19,6 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Deserialize)]
 struct CaptchaSolve {
+    challenge_id: Option<String>,
     answer: Option<String>,
 }
 
@@ -32,24 +33,46 @@ struct CaptchaState {
     secret: Arc<[u8]>,
     token_ttl_seconds: u64,
     issued: Arc<Mutex<HashMap<String, u64>>>,
+    challenges: Arc<Mutex<HashMap<String, (String, u64)>>>,
 }
 
 impl CaptchaState {
-    fn from_env() -> Self {
+    fn from_env() -> anyhow::Result<Self> {
         let configured = env_string("CAPTCHA_TOKEN_SECRET", "");
-        let secret = if configured.trim().is_empty() {
-            tracing::warn!(
-                "CAPTCHA_TOKEN_SECRET is not configured; generated tokens will be valid only for this process lifetime"
-            );
-            Uuid::new_v4().to_string()
-        } else {
-            configured
-        };
-        Self {
-            secret: Arc::from(secret.into_bytes()),
+        anyhow::ensure!(
+            configured.len() >= 32,
+            "CAPTCHA_TOKEN_SECRET must contain at least 32 characters; run scripts/configure_credentials.py"
+        );
+        Ok(Self {
+            secret: Arc::from(configured.into_bytes()),
             token_ttl_seconds: env_u64("CAPTCHA_TOKEN_TTL_SECONDS", 300).clamp(30, 3600),
             issued: Arc::new(Mutex::new(HashMap::new())),
-        }
+            challenges: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    async fn issue_challenge(&self) -> (String, String) {
+        let random = Uuid::new_v4();
+        let bytes = random.as_bytes();
+        let left = 2 + u16::from(bytes[0] % 8);
+        let right = 2 + u16::from(bytes[1] % 8);
+        let challenge_id = random.simple().to_string();
+        let expires_at = unix_seconds().saturating_add(self.token_ttl_seconds);
+        let mut challenges = self.challenges.lock().await;
+        let now = unix_seconds();
+        challenges.retain(|_, (_, expiry)| *expiry >= now);
+        challenges.insert(
+            challenge_id.clone(),
+            ((left + right).to_string(), expires_at),
+        );
+        (challenge_id, format!("What is {left} + {right}?"))
+    }
+
+    async fn solve_challenge(&self, challenge_id: &str, answer: &str) -> bool {
+        let Some((expected, expires_at)) = self.challenges.lock().await.remove(challenge_id) else {
+            return false;
+        };
+        expires_at >= unix_seconds() && expected == answer.trim()
     }
 
     async fn issue(&self) -> String {
@@ -102,14 +125,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/solve", post(solve))
         .route("/verify", post(verify))
         .merge(observability_router("captcha-service"))
-        .with_state(CaptchaState::from_env());
+        .with_state(CaptchaState::from_env()?);
     serve(app, config).await
 }
 
-async fn challenge() -> Html<&'static str> {
-    Html(
-        r#"<html><body><form method="post" action="/solve"><label>Type human</label><input name="answer" autocomplete="off"/><button type="submit">Verify</button></form></body></html>"#,
-    )
+async fn challenge(State(state): State<CaptchaState>) -> Html<String> {
+    let (challenge_id, question) = state.issue_challenge().await;
+    Html(format!(
+        r#"<html><body><form method="post" action="/solve"><label>{question}</label><input type="hidden" name="challenge_id" value="{challenge_id}"/><input name="answer" inputmode="numeric" autocomplete="off"/><button type="submit">Verify</button></form></body></html>"#,
+    ))
 }
 
 async fn solve(
@@ -118,11 +142,10 @@ async fn solve(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let payload: CaptchaSolve = decode_request(&headers, &body)?;
-    let ok = payload
-        .answer
-        .as_deref()
-        .map(|answer| answer.trim().eq_ignore_ascii_case("human"))
-        .unwrap_or(false);
+    let ok = match (payload.challenge_id.as_deref(), payload.answer.as_deref()) {
+        (Some(challenge_id), Some(answer)) => state.solve_challenge(challenge_id, answer).await,
+        _ => false,
+    };
     let token = if ok { Some(state.issue().await) } else { None };
     Ok(Json(json!({"success": ok, "token": token})))
 }
@@ -188,6 +211,7 @@ mod tests {
             secret: Arc::from(b"integration-secret".as_slice()),
             token_ttl_seconds: 300,
             issued: Arc::new(Mutex::new(HashMap::new())),
+            challenges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -198,8 +222,9 @@ mod tests {
             "content-type",
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
-        let payload: CaptchaSolve = decode_request(&headers, b"answer=human").unwrap();
-        assert_eq!(payload.answer.as_deref(), Some("human"));
+        let payload: CaptchaSolve = decode_request(&headers, b"challenge_id=abc&answer=7").unwrap();
+        assert_eq!(payload.challenge_id.as_deref(), Some("abc"));
+        assert_eq!(payload.answer.as_deref(), Some("7"));
     }
 
     #[test]
@@ -234,12 +259,26 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_solution_does_not_issue_token() {
-        let body = serde_json::to_vec(&json!({"answer":"robot"})).unwrap();
-        let Json(response) = solve(State(state()), HeaderMap::new(), Bytes::from(body))
+        let state = state();
+        let (challenge_id, _) = state.issue_challenge().await;
+        let body = serde_json::to_vec(&json!({
+            "challenge_id": challenge_id,
+            "answer":"not-the-answer"
+        }))
+        .unwrap();
+        let Json(response) = solve(State(state), HeaderMap::new(), Bytes::from(body))
             .await
             .expect("valid JSON should be accepted");
 
         assert_eq!(response["success"], false);
         assert!(response["token"].is_null());
+    }
+
+    #[tokio::test]
+    async fn challenge_is_one_time_and_not_a_constant_answer() {
+        let state = state();
+        let (challenge_id, _) = state.issue_challenge().await;
+        assert!(!state.solve_challenge(&challenge_id, "human").await);
+        assert!(!state.solve_challenge(&challenge_id, "human").await);
     }
 }

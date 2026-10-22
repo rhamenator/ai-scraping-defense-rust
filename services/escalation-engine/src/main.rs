@@ -188,8 +188,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn escalate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(mut metadata): Json<RequestMetadata>,
-) -> Json<EscalationResponse> {
+) -> Result<Json<EscalationResponse>, (StatusCode, Json<serde_json::Value>)> {
+    require_access(&headers)?;
     state.requests.fetch_add(1, Ordering::Relaxed);
     verify_tls_fingerprint(&mut metadata);
     let ip = metadata.ip.clone().unwrap_or_else(|| "unknown".to_string());
@@ -234,7 +236,7 @@ async fn escalate(
         }),
     )
     .await;
-    Json(EscalationResponse {
+    Ok(Json(EscalationResponse {
         status: "success",
         is_bot: decision.is_bot,
         score: decision.score,
@@ -242,7 +244,7 @@ async fn escalate(
         reason: decision.reason,
         fingerprint: decision.fingerprint,
         features: serde_json::to_value(decision.features).unwrap_or_else(|_| json!({})),
-    })
+    }))
 }
 
 fn verify_tls_fingerprint(metadata: &mut RequestMetadata) {
@@ -289,8 +291,27 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
     )
 }
 
-async fn security_events(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({"events": load_security_events(&state.audit, 100).await}))
+async fn security_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_access(&headers)?;
+    Ok(Json(
+        json!({"events": load_security_events(&state.audit, 100).await}),
+    ))
+}
+
+fn require_access(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if is_authorized(headers, "ESCALATION_API_KEY", "JWT_SECRET") {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "status":"error",
+            "message":"Unauthorized; provide x-api-key or a scoped Bearer JWT"
+        })),
+    ))
 }
 
 async fn reload_plugins(
