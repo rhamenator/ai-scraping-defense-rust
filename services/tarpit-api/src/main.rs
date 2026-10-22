@@ -32,16 +32,6 @@ fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn routes_build_with_axum_08() {
-        let _ = app(AppState { pg: None });
-    }
-}
-
 async fn root() -> impl IntoResponse {
     Html("<html><body><h1>AI Scraping Defense Rust Tarpit</h1></body></html>")
 }
@@ -86,4 +76,14 @@ fn html_escape(value: String) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_build_with_axum_08() {
+        let _ = app(AppState { pg: None });
+    }
 }

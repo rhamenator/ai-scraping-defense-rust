@@ -32,16 +32,6 @@ fn app(state: DashboardState) -> Router {
         .with_state(state)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn routes_build_with_axum_08() {
-        let _ = app(DashboardState::default());
-    }
-}
-
 async fn register(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(json!({"status":"registered","installation":payload}))
 }
@@ -86,4 +76,14 @@ async fn ws(ws: WebSocketUpgrade, Path(installation_id): Path<String>) -> impl I
             ))
             .await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_build_with_axum_08() {
+        let _ = app(DashboardState::default());
+    }
 }
