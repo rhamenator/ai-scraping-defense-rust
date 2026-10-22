@@ -42,6 +42,7 @@ The codebase also tracks API and deployment compatibility with the original Pyth
 
 ```powershell
 cp config/sample.env .env
+python scripts/configure_credentials.py
 cargo run -p escalation-engine
 ```
 

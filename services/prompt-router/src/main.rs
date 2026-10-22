@@ -1,5 +1,8 @@
-use asd_core::{env_string, env_u64, health, observability_router, serve, ServiceConfig};
+use asd_core::{
+    env_string, env_u64, health, is_authorized, observability_router, serve, ServiceConfig,
+};
 use axum::{
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -23,7 +26,18 @@ async fn main() -> anyhow::Result<()> {
     serve(app, config).await
 }
 
-async fn route_prompt(Json(req): Json<RouteRequest>) -> Json<serde_json::Value> {
+async fn route_prompt(
+    headers: HeaderMap,
+    Json(req): Json<RouteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !is_authorized(&headers, "PROMPT_ROUTER_API_KEY", "JWT_SECRET") {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(
+                json!({"status":"error","message":"Unauthorized; provide x-api-key or a scoped Bearer JWT"}),
+            ),
+        ));
+    }
     let max_local_tokens = env_u64("MAX_LOCAL_TOKENS", 2048);
     let requested = req.max_tokens.unwrap_or(0);
     let target = if requested > max_local_tokens {
@@ -33,33 +47,68 @@ async fn route_prompt(Json(req): Json<RouteRequest>) -> Json<serde_json::Value> 
     };
     if target == "cloud-proxy" {
         let url = env_string("CLOUD_PROXY_URL", "http://127.0.0.1:8008/api/chat");
-        match reqwest::Client::new().post(&url).json(&req).send().await {
+        let cloud_proxy_api_key = env_string("CLOUD_PROXY_API_KEY", "");
+        let request = reqwest::Client::new()
+            .post(&url)
+            .header("x-api-key", cloud_proxy_api_key)
+            .json(&req);
+        match request.send().await {
             Ok(response) => {
                 let status = response.status();
                 let body = response
                     .json::<serde_json::Value>()
                     .await
                     .unwrap_or_else(|_| json!({}));
-                return Json(json!({
-                    "status": if status.is_success() { "success" } else { "error" },
-                    "target": target,
-                    "upstream_status": status.as_u16(),
-                    "response": body
-                }));
+                return proxy_http_response(status, target, body);
             }
             Err(exc) => {
-                return Json(json!({
-                    "status": "error",
-                    "target": target,
-                    "message": exc.to_string()
-                }));
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "status": "error",
+                        "target": target,
+                        "message": exc.to_string()
+                    })),
+                ));
             }
         }
     }
-    Json(json!({
+    Ok(Json(json!({
         "status": "success",
         "target": target,
         "prompt_len": req.prompt.as_deref().unwrap_or("").len(),
         "max_local_tokens": max_local_tokens
-    }))
+    })))
+}
+
+fn proxy_http_response(
+    upstream_status: reqwest::StatusCode,
+    target: String,
+    body: serde_json::Value,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let payload = Json(json!({
+        "status": if upstream_status.is_success() { "success" } else { "error" },
+        "target": target,
+        "upstream_status": upstream_status.as_u16(),
+        "response": body
+    }));
+    if upstream_status.is_success() {
+        return Ok(payload);
+    }
+    Err((StatusCode::BAD_GATEWAY, payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_failure_returns_bad_gateway() {
+        let result = proxy_http_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "cloud-proxy".to_string(),
+            json!({"status": "error"}),
+        );
+        assert!(matches!(result, Err((StatusCode::BAD_GATEWAY, _))));
+    }
 }
