@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env("edge-ops", 8013);
     let pg = asd_core::pg_connect_from_env().await.map(Arc::new);
     let state = EdgeState {
-        blocklist: BlocklistState::from_env().await,
+        blocklist: BlocklistState::from_env().await?,
         audit: AuditStore::from_env(pg).await?,
     };
     let app = Router::new()
