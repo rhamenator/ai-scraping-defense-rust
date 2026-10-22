@@ -1440,20 +1440,22 @@ mod tests {
 
     #[test]
     fn hs256_jwt_decodes_verified_claims() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let wrong_secret = uuid::Uuid::new_v4().to_string();
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD
             .encode(r#"{"sub":"admin","roles":["ops"],"iat":1700000000,"exp":4102444800}"#);
         let signing_input = format!("{header}.{payload}");
-        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(signing_input.as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         let token = format!("{signing_input}.{signature}");
 
-        let claims = decode_hs256_jwt(&token, "secret").expect("verified claims");
+        let claims = decode_hs256_jwt(&token, &secret).expect("verified claims");
 
         assert_eq!(claims["sub"], "admin");
-        assert!(verify_hs256_jwt(&token, "secret"));
-        assert!(decode_hs256_jwt(&token, "wrong").is_none());
+        assert!(verify_hs256_jwt(&token, &secret));
+        assert!(decode_hs256_jwt(&token, &wrong_secret).is_none());
     }
 
     #[test]
