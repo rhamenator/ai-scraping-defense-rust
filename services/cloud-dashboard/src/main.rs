@@ -35,16 +35,18 @@ impl DashboardState {
 async fn main() -> anyhow::Result<()> {
     let _telemetry = asd_core::init_tracing("cloud-dashboard")?;
     let config = ServiceConfig::from_env("cloud-dashboard", 8006);
-    let state = DashboardState::from_env();
-    let app = Router::new()
+    serve(app(DashboardState::from_env()), config).await
+}
+
+fn app(state: DashboardState) -> Router {
+    Router::new()
         .route("/health", get(|| async { health("cloud-dashboard").await }))
         .route("/register", post(register))
         .route("/metrics", post(push_metrics))
-        .route("/metrics/:installation_id", get(get_metrics))
-        .route("/ws/:installation_id", get(ws))
+        .route("/metrics/{installation_id}", get(get_metrics))
+        .route("/ws/{installation_id}", get(ws))
         .merge(observability_router("cloud-dashboard"))
-        .with_state(state);
-    serve(app, config).await
+        .with_state(state)
 }
 
 async fn register(
@@ -129,9 +131,10 @@ async fn ws(
     }
     Ok(ws.on_upgrade(move |mut socket| async move {
         let _ = socket
-            .send(axum::extract::ws::Message::Text(format!(
-                "{{\"status\":\"connected\",\"installation_id\":\"{installation_id}\"}}"
-            )))
+            .send(axum::extract::ws::Message::Text(
+                format!("{{\"status\":\"connected\",\"installation_id\":\"{installation_id}\"}}")
+                    .into(),
+            ))
             .await;
     }))
 }
@@ -172,4 +175,14 @@ fn validate_installation_id(value: &str) -> Result<(), (StatusCode, Json<serde_j
 
 fn error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(json!({"status":"error","message":message})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_build_with_axum_08() {
+        let _ = app(DashboardState::from_env());
+    }
 }

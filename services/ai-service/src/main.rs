@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let pg = pg_connect_from_env().await.map(Arc::new);
     let state = AppState {
         config: config.clone(),
-        blocklist: BlocklistState::from_env().await,
+        blocklist: BlocklistState::from_env().await?,
         audit: AuditStore::from_env(pg).await?,
     };
     let app = Router::new()
@@ -96,7 +96,9 @@ async fn webhook(
         }
         "flag_ip" => {
             let reason = action.reason.unwrap_or_else(|| "flagged".into());
-            state.blocklist.flag(ip.to_string(), reason.clone()).await;
+            if !state.blocklist.flag(ip.to_string(), reason.clone()).await {
+                return Err(error(StatusCode::BAD_REQUEST, "Invalid IP"));
+            }
             record_security_event(
                 &state.audit,
                 "webhook_flag_ip",
@@ -224,5 +226,22 @@ mod tests {
 
         assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
         assert!(state.blocklist.blocked().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_flag_request_is_rejected_without_state_change() {
+        let state = state(Some("test-webhook-secret"));
+        let body = Bytes::from_static(br#"{"action":"flag_ip","ip":"not-an-ip"}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-signature",
+            asd_core::hmac_sha256_hex("test-webhook-secret", &body)
+                .parse()
+                .unwrap(),
+        );
+        let result = webhook(State(state.clone()), headers, body).await;
+
+        assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
+        assert_eq!(state.blocklist.stats().await.flagged_count, 0);
     }
 }
