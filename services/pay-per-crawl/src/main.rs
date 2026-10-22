@@ -51,18 +51,21 @@ async fn main() -> anyhow::Result<()> {
         pg: pg_connect_from_env().await.map(Arc::new),
     };
     ensure_crawler_table(state.pg.as_deref()).await?;
-    let app = Router::new()
+    serve(app(state), config).await
+}
+
+fn app(state: CrawlState) -> Router {
+    Router::new()
         .route("/health", get(|| async { health("pay-per-crawl").await }))
         .route("/register-crawler", post(register))
         .route("/customers", post(register))
         .route("/pay", post(pay))
         .route("/charge", post(pay))
         .route("/refund", post(refund))
-        .route("/balance/:token", get(balance))
-        .route("/proxy/*path", any(proxy))
+        .route("/balance/{token}", get(balance))
+        .route("/proxy/{*path}", any(proxy))
         .merge(observability_router("pay-per-crawl"))
-        .with_state(state);
-    serve(app, config).await
+        .with_state(state)
 }
 
 async fn register(
@@ -636,6 +639,11 @@ async fn ensure_crawler_table(pg: Option<&tokio_postgres::Client>) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routes_build_with_axum_08() {
+        let _ = app(CrawlState::default());
+    }
 
     #[test]
     fn crawler_token_and_hop_headers_are_not_forwardable() {

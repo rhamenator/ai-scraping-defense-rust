@@ -19,14 +19,17 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pg: pg_connect_from_env().await.map(Arc::new),
     };
-    let app = Router::new()
+    serve(app(state), config).await
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(|| async { health("tarpit-api").await }))
         .route("/", get(root))
-        .route("/tarpit/*path", get(tarpit))
+        .route("/tarpit/{*path}", get(tarpit))
         .route("/assets/fake.js", get(fake_js))
         .merge(observability_router("tarpit-api"))
-        .with_state(state);
-    serve(app, config).await
+        .with_state(state)
 }
 
 async fn root() -> impl IntoResponse {
@@ -73,4 +76,14 @@ fn html_escape(value: String) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_build_with_axum_08() {
+        let _ = app(AppState { pg: None });
+    }
 }
