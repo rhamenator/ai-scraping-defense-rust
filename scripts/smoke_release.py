@@ -45,6 +45,9 @@ def main() -> None:
         lockfiles = list(root.rglob("Cargo.lock"))
         if len(lockfiles) != 1:
             raise RuntimeError(f"expected packaged Cargo.lock inventory, found: {lockfiles}")
+        readmes = list(root.rglob("README.md"))
+        if len(readmes) != 1 or not (readmes[0].parent / ".github/assets/logo.png").is_file():
+            raise RuntimeError("packaged README logo is missing")
 
         environment = os.environ.copy()
         environment.update(

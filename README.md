@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/logo.png" alt="AI Scraping Defense Rust logo" width="220">
+</p>
+
 # AI Scraping Defense Rust
 
 AI Scraping Defense Rust is a defensive service stack for detecting, throttling, deceiving, and blocking unwanted AI crawlers and automated scraping traffic. It combines request scoring, Redis-backed blocklists, webhook-driven security actions, tarpit content generation, CAPTCHA challenges, payment-aware crawler access, provider-aware model routing, admin operations, and edge automation services into a deployable Rust workspace.
