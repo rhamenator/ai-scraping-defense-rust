@@ -31,7 +31,7 @@ async fn chat(
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "status":"error",
-                "message":"Unauthorized; configure CLOUD_PROXY_API_KEY with scripts/configure_credentials.py"
+                "message":"Unauthorized; provide x-api-key or a scoped Bearer JWT"
             })),
         ));
     }

@@ -775,19 +775,25 @@ pub fn decode_hs256_jwt(token: &str, secret: &str) -> Option<serde_json::Value> 
     {
         return None;
     }
-    if let Ok(expected) = env::var("JWT_ISSUER") {
-        if !expected.trim().is_empty()
-            && payload_json.get("iss").and_then(|value| value.as_str()) != Some(expected.as_str())
-        {
-            return None;
-        }
-    }
-    if let Ok(expected) = env::var("JWT_AUDIENCE") {
-        if !expected.trim().is_empty() && !jwt_audience_matches(&payload_json, &expected) {
-            return None;
-        }
+    let issuer = env::var("JWT_ISSUER").ok();
+    let audience = env::var("JWT_AUDIENCE").ok();
+    if !jwt_claims_match_config(&payload_json, issuer.as_deref(), audience.as_deref()) {
+        return None;
     }
     Some(payload_json)
+}
+
+fn jwt_claims_match_config(
+    claims: &serde_json::Value,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+) -> bool {
+    issuer
+        .filter(|value| !value.trim().is_empty())
+        .is_none_or(|expected| claims.get("iss").and_then(|value| value.as_str()) == Some(expected))
+        && audience
+            .filter(|value| !value.trim().is_empty())
+            .is_none_or(|expected| jwt_audience_matches(claims, expected))
 }
 
 fn jwt_audience_matches(claims: &serde_json::Value, expected: &str) -> bool {
@@ -1448,6 +1454,37 @@ mod tests {
         assert_eq!(claims["sub"], "admin");
         assert!(verify_hs256_jwt(&token, "secret"));
         assert!(decode_hs256_jwt(&token, "wrong").is_none());
+    }
+
+    #[test]
+    fn jwt_scope_issuer_and_audience_are_checked() {
+        let claims = serde_json::json!({
+            "scope": "cloud_proxy metrics:read",
+            "iss": "trusted-issuer",
+            "aud": ["other-service", "cloud-proxy"]
+        });
+        assert!(jwt_has_scope(&claims, "cloud_proxy"));
+        assert!(!jwt_has_scope(&claims, "admin"));
+        assert!(jwt_has_scope(
+            &serde_json::json!({"scp": ["admin"]}),
+            "admin"
+        ));
+        assert!(jwt_claims_match_config(
+            &claims,
+            Some("trusted-issuer"),
+            Some("cloud-proxy")
+        ));
+        assert!(!jwt_claims_match_config(
+            &claims,
+            Some("other-issuer"),
+            Some("cloud-proxy")
+        ));
+        assert!(!jwt_claims_match_config(
+            &claims,
+            Some("trusted-issuer"),
+            Some("other-audience")
+        ));
+        assert!(jwt_claims_match_config(&claims, None, None));
     }
 
     #[test]

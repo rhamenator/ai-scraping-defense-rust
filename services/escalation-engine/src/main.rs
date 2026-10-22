@@ -309,7 +309,7 @@ fn require_access(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_jso
         StatusCode::UNAUTHORIZED,
         Json(json!({
             "status":"error",
-            "message":"Unauthorized; configure ESCALATION_API_KEY with scripts/configure_credentials.py"
+            "message":"Unauthorized; provide x-api-key or a scoped Bearer JWT"
         })),
     ))
 }

@@ -34,7 +34,7 @@ async fn route_prompt(
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(
-                json!({"status":"error","message":"Unauthorized; configure PROMPT_ROUTER_API_KEY with scripts/configure_credentials.py"}),
+                json!({"status":"error","message":"Unauthorized; provide x-api-key or a scoped Bearer JWT"}),
             ),
         ));
     }

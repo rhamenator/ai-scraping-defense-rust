@@ -145,7 +145,7 @@ fn require_access(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_jso
     } else {
         Err(error(
             StatusCode::UNAUTHORIZED,
-            "Unauthorized; configure CLOUD_DASHBOARD_API_KEY with scripts/configure_credentials.py",
+            "Unauthorized; provide x-api-key or a scoped Bearer JWT",
         ))
     }
 }
