@@ -1,4 +1,4 @@
-use asd_core::{health, observability_router, serve, ServiceConfig};
+use asd_core::{health, is_authorized, observability_router, serve, ServiceConfig};
 use asd_providers::ModelProvider;
 use axum::{
     extract::ConnectInfo,
@@ -25,27 +25,48 @@ async fn chat(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !is_authorized(&headers, "CLOUD_PROXY_API_KEY", "JWT_SECRET") {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "status":"error",
+                "message":"Unauthorized; provide x-api-key or a scoped Bearer JWT"
+            })),
+        ));
+    }
     let payload = bind_trusted_tls_fingerprint(payload, peer, &headers);
     if let Some(provider) = ModelProvider::from_env() {
         match provider.predict(payload.clone()).await {
-            Ok(response) => return Json(response),
+            Ok(response) => return provider_http_response(response),
             Err(exc) => {
-                return Json(json!({
-                    "status": "error",
-                    "provider": "configured",
-                    "upstream_status": StatusCode::BAD_GATEWAY.as_u16(),
-                    "message": exc.to_string()
-                }));
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "status": "error",
+                        "provider": "configured",
+                        "upstream_status": StatusCode::BAD_GATEWAY.as_u16(),
+                        "message": exc.to_string()
+                    })),
+                ));
             }
         }
     }
-    Json(json!({
+    Ok(Json(json!({
         "status": "not_configured",
         "provider": "none",
         "message": "Set CLOUD_MODEL_API_URL and MODEL_PROVIDER to enable upstream model proxying",
         "request": payload
-    }))
+    })))
+}
+
+fn provider_http_response(
+    response: serde_json::Value,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if response.get("status").and_then(serde_json::Value::as_str) == Some("error") {
+        return Err((StatusCode::BAD_GATEWAY, Json(response)));
+    }
+    Ok(Json(response))
 }
 
 fn bind_trusted_tls_fingerprint(
@@ -165,5 +186,14 @@ mod tests {
             .is_some_and(|token| token.starts_with("v1:")));
         std::env::remove_var("SECURITY_TRUSTED_PROXY_CIDRS");
         std::env::remove_var("TLS_FINGERPRINT_ATTESTATION_KEY");
+    }
+
+    #[test]
+    fn upstream_error_payload_returns_bad_gateway() {
+        let result = provider_http_response(json!({
+            "status": "error",
+            "upstream_status": 503
+        }));
+        assert!(matches!(result, Err((StatusCode::BAD_GATEWAY, _))));
     }
 }

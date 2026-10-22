@@ -50,14 +50,18 @@ async fn webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if let Some(secret) = &state.config.webhook_shared_secret {
-        let signature = headers
-            .get("x-signature")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !verify_hmac_sha256(secret, &body, signature) {
-            return Err(error(StatusCode::UNAUTHORIZED, "Unauthorized"));
-        }
+    let Some(secret) = &state.config.webhook_shared_secret else {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WEBHOOK_SHARED_SECRET is not configured; run scripts/configure_credentials.py",
+        ));
+    };
+    let signature = headers
+        .get("x-signature")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !verify_hmac_sha256(secret, &body, signature) {
+        return Err(error(StatusCode::UNAUTHORIZED, "Unauthorized"));
     }
     let action: WebhookAction = serde_json::from_slice(&body)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid payload"))?;
@@ -125,12 +129,12 @@ fn error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Val
 mod tests {
     use super::*;
 
-    fn state(webhook_shared_secret: Option<&str>) -> AppState {
+    fn state() -> AppState {
         AppState {
             config: ServiceConfig {
                 service_name: "ai-service-test".into(),
                 port: 0,
-                webhook_shared_secret: webhook_shared_secret.map(str::to_string),
+                webhook_shared_secret: Some(uuid::Uuid::new_v4().to_string()),
                 escalation_threshold: 0.7,
                 throttle_threshold: 0.72,
                 tarpit_threshold: 0.82,
@@ -141,10 +145,20 @@ mod tests {
         }
     }
 
+    fn signed_headers(state: &AppState, body: &Bytes) -> HeaderMap {
+        let secret = state.config.webhook_shared_secret.as_deref().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-signature",
+            asd_core::hmac_sha256_hex(secret, body).parse().unwrap(),
+        );
+        headers
+    }
+
     #[tokio::test]
     async fn configured_webhook_secret_rejects_unsigned_requests() {
         let result = webhook(
-            State(state(Some("test-webhook-secret"))),
+            State(state()),
             HeaderMap::new(),
             Bytes::from_static(br#"{"action":"block_ip","ip":"198.51.100.11"}"#),
         )
@@ -155,55 +169,43 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_and_incomplete_payloads_fail_closed() {
-        let malformed = webhook(
-            State(state(None)),
-            HeaderMap::new(),
-            Bytes::from_static(b"not-json"),
-        )
-        .await;
+        let state = state();
+        let malformed_body = Bytes::from_static(b"not-json");
+        let malformed_headers = signed_headers(&state, &malformed_body);
+        let malformed = webhook(State(state.clone()), malformed_headers, malformed_body).await;
         assert!(matches!(malformed, Err((StatusCode::BAD_REQUEST, _))));
 
-        let missing_ip = webhook(
-            State(state(None)),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"action":"block_ip"}"#),
-        )
-        .await;
+        let missing_ip_body = Bytes::from_static(br#"{"action":"block_ip"}"#);
+        let missing_ip_headers = signed_headers(&state, &missing_ip_body);
+        let missing_ip = webhook(State(state), missing_ip_headers, missing_ip_body).await;
         assert!(matches!(missing_ip, Err((StatusCode::BAD_REQUEST, _))));
     }
 
     #[tokio::test]
     async fn block_and_allow_actions_change_blocklist_state() {
-        let state = state(None);
+        let state = state();
         let ip = "198.51.100.12";
-        let _ = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from(format!(r#"{{"action":"block_ip","ip":"{ip}"}}"#)),
-        )
-        .await
-        .expect("block action should succeed");
+        let body = Bytes::from(format!(r#"{{"action":"block_ip","ip":"{ip}"}}"#));
+        let headers = signed_headers(&state, &body);
+        let _ = webhook(State(state.clone()), headers, body)
+            .await
+            .expect("block action should succeed");
         assert!(state.blocklist.contains(ip).await);
 
-        let _ = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from(format!(r#"{{"action":"allow_ip","ip":"{ip}"}}"#)),
-        )
-        .await
-        .expect("allow action should succeed");
+        let body = Bytes::from(format!(r#"{{"action":"allow_ip","ip":"{ip}"}}"#));
+        let headers = signed_headers(&state, &body);
+        let _ = webhook(State(state.clone()), headers, body)
+            .await
+            .expect("allow action should succeed");
         assert!(!state.blocklist.contains(ip).await);
     }
 
     #[tokio::test]
     async fn invalid_ip_is_never_added_to_blocklist() {
-        let state = state(None);
-        let result = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"action":"block_ip","ip":"not-an-ip"}"#),
-        )
-        .await;
+        let state = state();
+        let body = Bytes::from_static(br#"{"action":"block_ip","ip":"not-an-ip"}"#);
+        let headers = signed_headers(&state, &body);
+        let result = webhook(State(state.clone()), headers, body).await;
 
         assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
         assert!(state.blocklist.blocked().await.is_empty());
@@ -211,13 +213,10 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_flag_request_is_rejected_without_state_change() {
-        let state = state(None);
-        let result = webhook(
-            State(state.clone()),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"action":"flag_ip","ip":"not-an-ip"}"#),
-        )
-        .await;
+        let state = state();
+        let body = Bytes::from_static(br#"{"action":"flag_ip","ip":"not-an-ip"}"#);
+        let headers = signed_headers(&state, &body);
+        let result = webhook(State(state.clone()), headers, body).await;
 
         assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
         assert_eq!(state.blocklist.stats().await.flagged_count, 0);
