@@ -51,7 +51,8 @@ pub struct RequestMetadata {
     /// Derived by a verifier inside the service; JSON callers cannot assert it.
     #[serde(default, skip_deserializing)]
     pub tls_fingerprint_verified: bool,
-    /// Set only after forward-confirmed reverse DNS or equivalent provider verification.
+    /// Reserved for a service-side verifier; request JSON cannot assert bot identity.
+    #[serde(default, skip_deserializing)]
     pub verified_bot: Option<bool>,
 }
 
@@ -188,6 +189,8 @@ pub fn extract_features(metadata: &RequestMetadata, freq: FrequencyFeatures) -> 
     let ua = metadata.user_agent.as_deref().unwrap_or("");
     let ua_lower = ua.to_ascii_lowercase();
     let path = metadata.path.as_deref().unwrap_or("");
+    let normalized_path = normalize_path_for_scoring(path);
+    let normalized_path = normalized_path.as_deref().unwrap_or(path);
     let referer = metadata.referer.as_deref().unwrap_or("");
     let timestamp = metadata.timestamp.unwrap_or_else(Utc::now);
 
@@ -204,8 +207,13 @@ pub fn extract_features(metadata: &RequestMetadata, freq: FrequencyFeatures) -> 
         path_length: path.len(),
         path_is_root: u8::from(path == "/"),
         path_has_docs: u8::from(path.contains("/docs")),
-        path_is_wp: u8::from(path.contains("/wp-") || path.contains("/xmlrpc.php")),
-        path_disallowed: u8::from(is_disallowed_path(path)),
+        path_is_wp: u8::from(
+            path.contains("/wp-")
+                || path.contains("/xmlrpc.php")
+                || normalized_path.contains("/wp-")
+                || normalized_path.contains("/xmlrpc.php"),
+        ),
+        path_disallowed: u8::from(is_disallowed_path(path) || is_disallowed_path(normalized_path)),
         ua_is_known_bad: u8::from(KNOWN_BAD_UAS.iter().any(|needle| ua_lower.contains(needle))),
         ua_is_known_benign_crawler: u8::from(
             metadata.verified_bot.unwrap_or(false)
@@ -386,6 +394,54 @@ fn is_disallowed_path(path: &str) -> bool {
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+// Score the supplied path and a bounded decoded view. Some origins decode encoded
+// separators more than once; three passes cover common proxy/origin differences.
+fn normalize_path_for_scoring(path: &str) -> Option<String> {
+    if path.len() > 8192 {
+        return None;
+    }
+    let mut normalized = path.to_string();
+    for _ in 0..3 {
+        let bytes = normalized.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                if let (Some(hi), Some(lo)) = (
+                    (bytes[index + 1] as char).to_digit(16),
+                    (bytes[index + 2] as char).to_digit(16),
+                ) {
+                    decoded.push(((hi << 4) | lo) as u8);
+                    index += 3;
+                    continue;
+                }
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+        let next = String::from_utf8(decoded).ok()?;
+        if next == normalized {
+            break;
+        }
+        normalized = next;
+    }
+    let mut normalized = normalized.replace('\\', "/").to_ascii_lowercase();
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    let mut segments = Vec::new();
+    for segment in normalized.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
 #[derive(Clone, Default)]
 pub struct InMemoryFrequency {
     inner: Arc<RwLock<HashMap<String, Vec<std::time::Instant>>>>,
@@ -466,6 +522,48 @@ mod tests {
 
         assert_eq!(unverified.ua_is_known_benign_crawler, 0);
         assert_eq!(verified.ua_is_known_benign_crawler, 1);
+    }
+
+    #[test]
+    fn request_json_cannot_assert_verified_bot() {
+        let metadata: RequestMetadata = serde_json::from_str(
+            r#"{"user_agent":"Googlebot/2.1","path":"/admin","verified_bot":true}"#,
+        )
+        .unwrap();
+        assert_eq!(metadata.verified_bot, None);
+        assert_eq!(
+            extract_features(&metadata, FrequencyFeatures::default()).ua_is_known_benign_crawler,
+            0
+        );
+    }
+
+    #[test]
+    fn encoded_sensitive_paths_are_scored() {
+        for path in [
+            "/%61dmin",
+            "/%2eenv",
+            "/%77p-admin",
+            "/%2577p-admin",
+            "/%5cadmin",
+            "/safe/%2e%2e/admin",
+        ] {
+            let features = extract_features(
+                &RequestMetadata {
+                    path: Some(path.into()),
+                    ..Default::default()
+                },
+                FrequencyFeatures::default(),
+            );
+            assert_eq!(features.path_disallowed, 1, "{path}");
+        }
+        let benign = extract_features(
+            &RequestMetadata {
+                path: Some("/administrator".into()),
+                ..Default::default()
+            },
+            FrequencyFeatures::default(),
+        );
+        assert_eq!(benign.path_disallowed, 0);
     }
 
     #[test]

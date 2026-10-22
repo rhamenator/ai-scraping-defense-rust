@@ -191,6 +191,10 @@ impl BlocklistState {
             return false;
         };
         let reason = reason.into();
+        if reason.trim().is_empty() || reason.len() > 256 {
+            tracing::warn!(ip = %ip, "refusing to flag IP with invalid reason length");
+            return false;
+        }
         self.flagged
             .write()
             .await
@@ -1404,6 +1408,8 @@ mod tests {
         state.unflag("2001:db8::1").await;
         assert!(state.flagged.read().await.is_empty());
         assert!(!state.flag("not-an-ip", "probe").await);
+        assert!(!state.flag("198.51.100.7", " ").await);
+        assert!(!state.flag("198.51.100.7", "x".repeat(257)).await);
         assert!(state.flagged.read().await.is_empty());
     }
 
