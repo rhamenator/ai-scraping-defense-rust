@@ -1,7 +1,7 @@
 use asd_core::{env_string, env_u64, health, observability_router, serve, ServiceConfig};
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
@@ -11,11 +11,19 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 use sha2::Sha256;
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::SystemTime,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+const MAX_ACTIVE_CHALLENGES: usize = 10_000;
+const MAX_ISSUED_TOKENS: usize = 10_000;
+const MAX_CHALLENGES_PER_SOURCE_PER_MINUTE: u32 = 60;
 
 #[derive(Deserialize)]
 struct CaptchaSolve {
@@ -34,6 +42,9 @@ struct CaptchaState {
     token_ttl_seconds: u64,
     issued: Arc<Mutex<HashMap<String, u64>>>,
     challenges: Arc<Mutex<HashMap<String, (String, u64)>>>,
+    max_active_challenges: usize,
+    max_issued_tokens: usize,
+    challenge_sources: Arc<Mutex<HashMap<IpAddr, (u64, u32)>>>,
 }
 
 impl CaptchaState {
@@ -48,10 +59,13 @@ impl CaptchaState {
             token_ttl_seconds: env_u64("CAPTCHA_TOKEN_TTL_SECONDS", 300).clamp(30, 3600),
             issued: Arc::new(Mutex::new(HashMap::new())),
             challenges: Arc::new(Mutex::new(HashMap::new())),
+            max_active_challenges: MAX_ACTIVE_CHALLENGES,
+            max_issued_tokens: MAX_ISSUED_TOKENS,
+            challenge_sources: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    async fn issue_challenge(&self) -> (String, String) {
+    async fn issue_challenge(&self) -> Option<(String, String)> {
         let random = Uuid::new_v4();
         let bytes = random.as_bytes();
         let left = 2 + u16::from(bytes[0] % 8);
@@ -61,11 +75,14 @@ impl CaptchaState {
         let mut challenges = self.challenges.lock().await;
         let now = unix_seconds();
         challenges.retain(|_, (_, expiry)| *expiry >= now);
+        if challenges.len() >= self.max_active_challenges {
+            return None;
+        }
         challenges.insert(
             challenge_id.clone(),
             ((left + right).to_string(), expires_at),
         );
-        (challenge_id, format!("What is {left} + {right}?"))
+        Some((challenge_id, format!("What is {left} + {right}?")))
     }
 
     async fn solve_challenge(&self, challenge_id: &str, answer: &str) -> bool {
@@ -75,7 +92,25 @@ impl CaptchaState {
         expires_at >= unix_seconds() && expected == answer.trim()
     }
 
-    async fn issue(&self) -> String {
+    async fn admit_challenge_source(&self, peer: IpAddr) -> bool {
+        let now = unix_seconds();
+        let mut sources = self.challenge_sources.lock().await;
+        sources.retain(|_, (window, _)| now.saturating_sub(*window) < 60);
+        if let Some((_, count)) = sources.get_mut(&peer) {
+            if *count >= MAX_CHALLENGES_PER_SOURCE_PER_MINUTE {
+                return false;
+            }
+            *count += 1;
+            return true;
+        }
+        if sources.len() >= 10_000 {
+            return false;
+        }
+        sources.insert(peer, (now, 1));
+        true
+    }
+
+    async fn issue(&self) -> Option<String> {
         let expires_at = unix_seconds().saturating_add(self.token_ttl_seconds);
         let nonce = Uuid::new_v4().simple().to_string();
         let payload = format!("{expires_at}.{nonce}");
@@ -83,8 +118,11 @@ impl CaptchaState {
         let mut issued = self.issued.lock().await;
         let now = unix_seconds();
         issued.retain(|_, expiry| *expiry >= now);
+        if issued.len() >= self.max_issued_tokens {
+            return None;
+        }
         issued.insert(nonce, expires_at);
-        format!("{payload}.{signature}")
+        Some(format!("{payload}.{signature}"))
     }
 
     async fn verify_once(&self, token: &str) -> bool {
@@ -129,11 +167,20 @@ async fn main() -> anyhow::Result<()> {
     serve(app, config).await
 }
 
-async fn challenge(State(state): State<CaptchaState>) -> Html<String> {
-    let (challenge_id, question) = state.issue_challenge().await;
-    Html(format!(
+async fn challenge(
+    State(state): State<CaptchaState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Html<String>, StatusCode> {
+    if !state.admit_challenge_source(peer.ip()).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let (challenge_id, question) = state
+        .issue_challenge()
+        .await
+        .ok_or(StatusCode::TOO_MANY_REQUESTS)?;
+    Ok(Html(format!(
         r#"<html><body><form method="post" action="/solve"><label>{question}</label><input type="hidden" name="challenge_id" value="{challenge_id}"/><input name="answer" inputmode="numeric" autocomplete="off"/><button type="submit">Verify</button></form></body></html>"#,
-    ))
+    )))
 }
 
 async fn solve(
@@ -146,7 +193,13 @@ async fn solve(
         (Some(challenge_id), Some(answer)) => state.solve_challenge(challenge_id, answer).await,
         _ => false,
     };
-    let token = if ok { Some(state.issue().await) } else { None };
+    let token = if ok { state.issue().await } else { None };
+    if ok && token.is_none() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"status":"capacity_exceeded"})),
+        ));
+    }
     Ok(Json(json!({"success": ok, "token": token})))
 }
 
@@ -212,6 +265,9 @@ mod tests {
             token_ttl_seconds: 300,
             issued: Arc::new(Mutex::new(HashMap::new())),
             challenges: Arc::new(Mutex::new(HashMap::new())),
+            max_active_challenges: MAX_ACTIVE_CHALLENGES,
+            max_issued_tokens: MAX_ISSUED_TOKENS,
+            challenge_sources: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -236,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn issued_token_verifies_exactly_once() {
         let state = state();
-        let token = state.issue().await;
+        let token = state.issue().await.unwrap();
         assert!(state.verify_once(&token).await);
         assert!(!state.verify_once(&token).await);
     }
@@ -249,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn tampered_token_is_rejected_without_consuming_original() {
         let state = state();
-        let token = state.issue().await;
+        let token = state.issue().await.unwrap();
         let mut tampered = token.clone();
         tampered.push('0');
 
@@ -260,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_solution_does_not_issue_token() {
         let state = state();
-        let (challenge_id, _) = state.issue_challenge().await;
+        let (challenge_id, _) = state.issue_challenge().await.unwrap();
         let body = serde_json::to_vec(&json!({
             "challenge_id": challenge_id,
             "answer":"not-the-answer"
@@ -277,8 +333,37 @@ mod tests {
     #[tokio::test]
     async fn challenge_is_one_time_and_not_a_constant_answer() {
         let state = state();
-        let (challenge_id, _) = state.issue_challenge().await;
+        let (challenge_id, _) = state.issue_challenge().await.unwrap();
         assert!(!state.solve_challenge(&challenge_id, "human").await);
         assert!(!state.solve_challenge(&challenge_id, "human").await);
+    }
+
+    #[tokio::test]
+    async fn challenge_and_token_state_have_capacity_limits() {
+        let mut state = state();
+        state.max_active_challenges = 2;
+        state.max_issued_tokens = 1;
+        assert!(state.issue_challenge().await.is_some());
+        assert!(state.issue_challenge().await.is_some());
+        assert!(state.issue_challenge().await.is_none());
+        assert_eq!(state.challenges.lock().await.len(), 2);
+        assert!(state.issue().await.is_some());
+        assert!(state.issue().await.is_none());
+        assert_eq!(state.issued.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn challenge_source_is_rate_limited() {
+        let state = state();
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..MAX_CHALLENGES_PER_SOURCE_PER_MINUTE {
+            assert!(state.admit_challenge_source(peer).await);
+        }
+        assert!(!state.admit_challenge_source(peer).await);
+        assert!(
+            state
+                .admit_challenge_source("192.0.2.2".parse().unwrap())
+                .await
+        );
     }
 }

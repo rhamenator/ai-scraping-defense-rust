@@ -7,7 +7,7 @@ use asd_core::{
     ServiceConfig,
 };
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -18,7 +18,13 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 
@@ -30,6 +36,7 @@ struct AppState {
     audit: AuditStore,
     oidc: oidc::OidcVerifier,
     passkeys: Arc<webauthn::PasskeyService>,
+    mfa_attempts: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
 }
 
 #[tokio::main]
@@ -47,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         audit,
         oidc,
         passkeys,
+        mfa_attempts: Arc::new(Mutex::new(HashMap::new())),
     };
     ensure_admin_auth_tables(state.pg.as_deref()).await?;
     let app = Router::new()
@@ -97,6 +105,16 @@ async fn require_admin_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
+    if matches!(path, "/mfa/totp/verify" | "/mfa/backup-codes/verify") {
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip())
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        if !admit_mfa_attempt(&state.mfa_attempts, peer).await {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+    }
     let public_path = matches!(
         path,
         "/" | "/health"
@@ -123,6 +141,27 @@ async fn require_admin_middleware(
         }
     }
     next.run(request).await
+}
+
+async fn admit_mfa_attempt(
+    attempts: &Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    peer: IpAddr,
+) -> bool {
+    let now = Instant::now();
+    let mut attempts = attempts.lock().await;
+    attempts.retain(|_, (window, _)| now.duration_since(*window) < Duration::from_secs(60));
+    if let Some((_, count)) = attempts.get_mut(&peer) {
+        if *count >= 30 {
+            return false;
+        }
+        *count += 1;
+        return true;
+    }
+    if attempts.len() >= 10_000 {
+        return false;
+    }
+    attempts.insert(peer, (now, 1));
+    true
 }
 
 async fn index() -> Html<&'static str> {
@@ -427,8 +466,10 @@ async fn mfa_totp_verify(
     Json(payload): Json<TotpVerifyRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let user = admin_user(payload.user);
-    let secret = ensure_mfa_record(state.pg.as_deref(), &user).await?;
-    let valid = verify_totp(&secret, &payload.code);
+    let secret = read_mfa_secret(state.pg.as_deref(), &user).await?;
+    let valid = secret
+        .as_deref()
+        .is_some_and(|secret| verify_totp(secret, &payload.code));
     Ok(Json(
         json!({"status": if valid { "success" } else { "error" }, "valid": valid}),
     ))
@@ -706,6 +747,23 @@ async fn ensure_mfa_record(
     Ok(secret)
 }
 
+async fn read_mfa_secret(
+    pg: Option<&tokio_postgres::Client>,
+    user: &str,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(pg) = pg else {
+        return Err(storage_required());
+    };
+    let row = pg
+        .query_opt(
+            "SELECT totp_secret FROM admin_mfa WHERE user_name = $1",
+            &[&user],
+        )
+        .await
+        .map_err(|exc| internal_error(exc.to_string()))?;
+    Ok(row.map(|row| row.get(0)))
+}
+
 async fn backup_hashes(
     pg: Option<&tokio_postgres::Client>,
     user: &str,
@@ -784,4 +842,20 @@ fn internal_error(message: String) -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"status":"error","message":message})),
     )
+}
+
+#[cfg(test)]
+mod mfa_rate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn public_mfa_attempts_are_bounded_per_peer() {
+        let attempts = Mutex::new(HashMap::new());
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..30 {
+            assert!(admit_mfa_attempt(&attempts, peer).await);
+        }
+        assert!(!admit_mfa_attempt(&attempts, peer).await);
+        assert!(admit_mfa_attempt(&attempts, "192.0.2.2".parse().unwrap()).await);
+    }
 }

@@ -40,7 +40,13 @@ pub fn generate_page_with_content(path_hint: Option<&str>, content: Option<Strin
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let path_meta = path_hint.unwrap_or("/");
+    let path_meta = path_hint
+        .unwrap_or("/")
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&#39;");
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -175,4 +181,16 @@ fn random_alpha(rng: &mut ThreadRng, len: usize) -> String {
     (0..len)
         .map(|_| (b'a' + rng.random_range(0..26)) as char)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_attribute_escapes_markup() {
+        let page = generate_page_with_content(Some("x\"><svg/onload=alert(1)>&'"), None);
+        assert!(page.contains("data-path=\"x&quot;&gt;&lt;svg/onload=alert(1)&gt;&amp;&#39;\""));
+        assert!(!page.contains("data-path=\"x\"><svg"));
+    }
 }

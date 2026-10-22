@@ -26,6 +26,7 @@ Important settings:
 - `ADMIN_API_KEY`, `ESCALATION_API_KEY`, `PUBLIC_BLOCKLIST_API_KEY`, `JWT_SECRET`: API-key and JWT protection for mutation routes.
 - `WEBHOOK_SHARED_SECRET`: HMAC secret for AI service webhooks.
 - `CAPTCHA_TOKEN_SECRET`, `CAPTCHA_TOKEN_TTL_SECONDS`: shared HMAC key and lifetime for one-time CAPTCHA verification tokens. Configure the same secret on every CAPTCHA replica.
+
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
 - `DETECTION_MODEL_PATH`: optional path to a versioned logistic-regression
   artifact emitted by `POST /training/train` on `rag-trainer`. The escalation
@@ -47,6 +48,22 @@ Important settings:
 - `ADMIN_UI_WEBAUTHN_ORIGIN`, `ADMIN_UI_WEBAUTHN_RP_ID`, `ADMIN_UI_WEBAUTHN_RP_NAME`: the browser origin and stable relying-party identity for native passkey registration and authentication. Changing the RP ID after credentials are registered invalidates those credentials. PostgreSQL is required for one-time ceremony state, credentials, and hashed admin sessions.
 - `EDGE_ALLOWED_DOMAINS`, `REAL_BACKEND_HOST`, `RULES_URL`, `CDN_PURGE_URL`: edge operations configuration.
 - `ENABLE_GLOBAL_CDN`, `CLOUD_CDN_PROVIDER`, and `SECURITY_CDN_TRUSTED_PROXY_CIDRS`: optional Cloudflare ingress integration. Configure Cloudflare's published proxy ranges so originating client IPs—not Cloudflare edge addresses—are evaluated and blocked.
+
+The CAPTCHA service admits up to 60 challenges per connecting IP each minute and
+retains at most 10,000 active challenges and 10,000 issued tokens per replica.
+Capacity or rate exhaustion returns HTTP 429. The public admin MFA verification
+routes admit up to 30 attempts per connecting IP each minute. If these services
+are behind a proxy, the limit applies to the proxy's connection address; set
+matching limits at the ingress for individual clients.
+
+Escalation scoring checks both the supplied request path and a normalized path
+with up to three percent-decoding passes, backslash and repeated-slash
+normalization, dot-segment removal, and ASCII case folding. Paths longer than
+8192 bytes retain only the raw-path check. The `verified_bot` field in request
+JSON is ignored; only service-derived verification can grant benign crawler
+credit. Public blocklist reports require `PUBLIC_BLOCKLIST_API_KEY`, a valid
+client IP outside local and configured trusted ranges, and a reason of at most
+256 bytes.
 
 Cloudflare is treated as an ingress/CDN boundary, not as a general outbound proxy. Ordinary model, payment, rules, and backend requests continue directly to their configured destinations, avoiding unnecessary Cloudflare traffic charges. When Cloudflare integration is enabled and the request/bot thresholds are exceeded, `config-recommender` returns an advisory to consider Under Attack Mode; it never changes the Cloudflare account automatically.
 

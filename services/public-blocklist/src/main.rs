@@ -1,6 +1,7 @@
 use asd_core::{
-    has_valid_api_key, health, is_authorized, observability_router, pg_connect_from_env,
-    record_security_event, serve, AuditStore, BlocklistState, IpAction, ServiceConfig,
+    has_valid_api_key, health, is_authorized, is_blockable_client_ip, observability_router,
+    pg_connect_from_env, record_security_event, serve, AuditStore, BlocklistState, IpAction,
+    ServiceConfig,
 };
 use axum::{
     extract::{Request, State},
@@ -63,12 +64,17 @@ async fn report(
     Json(action): Json<IpAction>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if let Some(ip) = action.ip.and_then(|ip| ip.parse::<IpAddr>().ok()) {
+        if !is_reportable_ip(ip) || !is_blockable_client_ip(&ip.to_string()) {
+            return Err(bad_request("public client IP required"));
+        }
         let reason = action.reason.unwrap_or_else(|| "community_report".into());
-        if reason.is_empty() || reason.len() > 256 {
+        if reason.trim().is_empty() || reason.len() > 256 {
             return Err(bad_request("reason must be 1 to 256 bytes"));
         }
         let ip = ip.to_string();
-        state.blocklist.flag(ip.clone(), reason.clone()).await;
+        if !state.blocklist.flag(ip.clone(), reason.clone()).await {
+            return Err(bad_request("public client IP required"));
+        }
         record_security_event(
             &state.audit,
             "public_blocklist_report",
@@ -79,6 +85,26 @@ async fn report(
         Ok(Json(json!({"status":"accepted","ip":ip})))
     } else {
         Err(bad_request("valid IP required"))
+    }
+}
+
+fn is_reportable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+        }
     }
 }
 
@@ -168,6 +194,23 @@ mod tests {
             assert_eq!(response.status(), expected);
         }
         assert_eq!(state.blocklist.stats().await.flagged_count, 0);
+
+        for ip in ["127.0.0.1", "10.0.0.1", "::1", "fe80::1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/report")
+                        .header("x-api-key", "test-only-secret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"ip":ip}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{ip}");
+        }
 
         let too_long = json!({"ip":"198.51.100.23","reason":"x".repeat(257)});
         let response = app
