@@ -16,12 +16,103 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 use std::{
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Mutex;
+
+#[derive(Default)]
+struct IncidentWindow {
+    events: VecDeque<(u64, String, bool)>,
+    last_dispatch: u64,
+}
+
+#[derive(Clone)]
+struct IncidentReporter {
+    client: reqwest::Client,
+    url: String,
+    key: String,
+    site_id: String,
+    window_seconds: u64,
+    minimum_requests: usize,
+    max_samples: usize,
+    state: Arc<Mutex<IncidentWindow>>,
+}
+
+impl IncidentReporter {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()?,
+            url: env_string("INCIDENT_EVALUATOR_URL", ""),
+            key: env_string("INCIDENT_EVALUATOR_API_KEY", ""),
+            site_id: env_string("INCIDENT_SITE_ID", "default-site"),
+            window_seconds: env_u64("INCIDENT_MAX_WINDOW_SECONDS", 300).clamp(30, 3600),
+            minimum_requests: env_u64("CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_REQUESTS", 100)
+                as usize,
+            max_samples: env_u64("INCIDENT_MAX_SAMPLES", 10_000).clamp(100, 100_000) as usize,
+            state: Arc::new(Mutex::new(IncidentWindow::default())),
+        })
+    }
+
+    async fn record(&self, ip: &str, is_bot: bool) {
+        if self.url.is_empty() || self.key.is_empty() || ip.parse::<std::net::IpAddr>().is_err() {
+            return;
+        }
+        let now = unix_seconds() as u64;
+        let mut state = self.state.lock().await;
+        state.events.push_back((now, ip.to_string(), is_bot));
+        while state
+            .events
+            .front()
+            .is_some_and(|(at, _, _)| now.saturating_sub(*at) >= self.window_seconds)
+        {
+            state.events.pop_front();
+        }
+        while state.events.len() > self.max_samples {
+            state.events.pop_front();
+        }
+        if state.events.len() < self.minimum_requests
+            || now.saturating_sub(state.last_dispatch) < 30
+        {
+            return;
+        }
+        let total = state.events.len();
+        let bots = state.events.iter().filter(|(_, _, bot)| *bot).count();
+        let unique = state
+            .events
+            .iter()
+            .map(|(_, ip, _)| ip.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let start = state.events.front().map(|(at, _, _)| *at).unwrap_or(now);
+        state.last_dispatch = now;
+        drop(state);
+        let signal = json!({"site_id":self.site_id,"window_start":start.saturating_sub(1),
+            "window_end":now,"total_requests":total,"bot_requests":bots,"unique_source_ips":unique});
+        match self
+            .client
+            .post(&self.url)
+            .header("x-api-key", &self.key)
+            .json(&signal)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), "incident evaluator rejected signal");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "incident evaluator unavailable");
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct FrequencyStore {
@@ -130,6 +221,7 @@ struct AppState {
     model_path: Option<Arc<String>>,
     requests: Arc<AtomicU64>,
     bots: Arc<AtomicU64>,
+    incident: IncidentReporter,
 }
 
 #[derive(Serialize)]
@@ -170,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         model_path,
         requests: Arc::new(AtomicU64::new(0)),
         bots: Arc::new(AtomicU64::new(0)),
+        incident: IncidentReporter::from_env()?,
     };
     let app = Router::new()
         .route(
@@ -211,6 +304,12 @@ async fn escalate(
     );
     if decision.is_bot {
         state.bots.fetch_add(1, Ordering::Relaxed);
+    }
+    if !state.incident.url.is_empty() {
+        let reporter = state.incident.clone();
+        let bot = decision.is_bot;
+        let incident_ip = ip.clone();
+        tokio::spawn(async move { reporter.record(&incident_ip, bot).await });
     }
     if decision.action == "block_ip" && ip != "unknown" && !state.blocklist.block(ip.clone()).await
     {

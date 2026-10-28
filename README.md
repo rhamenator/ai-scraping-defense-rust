@@ -20,6 +20,7 @@ Implemented baseline services:
 - `cloud-dashboard`: installation registration and metrics fanout endpoints
 - `cloud-proxy`: `/health`, `/api/chat`
 - `config-recommender`: `/recommendations`
+- `config-recommender`: authenticated `POST /incident/evaluate` accepts recent traffic windows and delivers deduplicated operator alerts to `ADMIN_ALERT_WEBHOOK_URL`. Escalation sends live request-window signals when `INCIDENT_EVALUATOR_API_KEY` is configured. Alerts offer manual Cloudflare Under Attack Mode review and, when configured origin health checks show primary unhealthy and backup healthy, manual failover review. Window aggregation and alert deduplication are process-local; use one replica of each service or add a shared incident store before scaling horizontally.
 - `edge-ops`: robots/rules fetching, WAF/CDN/TLS/DDoS operations, blocklist sync
 - `pay-per-crawl`: crawler registration, payment, proxy charging
 - `prompt-router`: `/health`, `/route`
