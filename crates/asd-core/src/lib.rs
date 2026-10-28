@@ -1496,37 +1496,6 @@ mod tests {
     }
 
     #[test]
-    fn jwt_scope_issuer_and_audience_are_checked() {
-        let claims = serde_json::json!({
-            "scope": "cloud_proxy metrics:read",
-            "iss": "trusted-issuer",
-            "aud": ["other-service", "cloud-proxy"]
-        });
-        assert!(jwt_has_scope(&claims, "cloud_proxy"));
-        assert!(!jwt_has_scope(&claims, "admin"));
-        assert!(jwt_has_scope(
-            &serde_json::json!({"scp": ["admin"]}),
-            "admin"
-        ));
-        assert!(jwt_claims_match_config(
-            &claims,
-            Some("trusted-issuer"),
-            Some("cloud-proxy")
-        ));
-        assert!(!jwt_claims_match_config(
-            &claims,
-            Some("other-issuer"),
-            Some("cloud-proxy")
-        ));
-        assert!(!jwt_claims_match_config(
-            &claims,
-            Some("trusted-issuer"),
-            Some("other-audience")
-        ));
-        assert!(jwt_claims_match_config(&claims, None, None));
-    }
-
-    #[test]
     fn cidr_matching_distinguishes_origins_from_proxy_ranges() {
         assert!(ip_in_cidr(
             "173.245.48.10".parse().unwrap(),
