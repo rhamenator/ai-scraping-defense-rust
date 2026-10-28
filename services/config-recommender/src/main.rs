@@ -85,12 +85,13 @@ async fn origin_healthy(client: &reqwest::Client, url: &str) -> Option<bool> {
     if url.is_empty() {
         return None;
     }
-    client
-        .get(url)
-        .send()
-        .await
-        .ok()
-        .map(|response| response.status().is_success())
+    Some(
+        client
+            .get(url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success()),
+    )
 }
 
 async fn evaluate_incident(
@@ -260,6 +261,19 @@ fn should_recommend_cloudflare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_configured_origin_is_unhealthy() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        assert_eq!(origin_healthy(&client, "").await, None);
+        assert_eq!(
+            origin_healthy(&client, "http://127.0.0.1:0/health").await,
+            Some(false)
+        );
+    }
 
     #[test]
     fn cloudflare_recommendation_requires_integration_and_attack_evidence() {

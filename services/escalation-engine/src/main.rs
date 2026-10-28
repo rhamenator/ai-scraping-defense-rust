@@ -29,6 +29,8 @@ use tokio::sync::Mutex;
 struct IncidentWindow {
     events: VecDeque<(u64, String, bool)>,
     last_dispatch: u64,
+    timer_armed: bool,
+    pending_events: usize,
 }
 
 #[derive(Clone)]
@@ -67,6 +69,7 @@ impl IncidentReporter {
         let now = unix_seconds() as u64;
         let mut state = self.state.lock().await;
         state.events.push_back((now, ip.to_string(), is_bot));
+        state.pending_events += 1;
         while state
             .events
             .front()
@@ -77,7 +80,31 @@ impl IncidentReporter {
         while state.events.len() > self.max_samples {
             state.events.pop_front();
         }
-        if state.events.len() < self.minimum_requests
+        if state.events.len() < self.minimum_requests {
+            return;
+        }
+        if now.saturating_sub(state.last_dispatch) < 30 {
+            if !state.timer_armed {
+                state.timer_armed = true;
+                let delay = 30 - now.saturating_sub(state.last_dispatch);
+                let reporter = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    reporter.dispatch().await;
+                });
+            }
+            return;
+        }
+        drop(state);
+        self.dispatch().await;
+    }
+
+    async fn dispatch(&self) {
+        let now = unix_seconds() as u64;
+        let mut state = self.state.lock().await;
+        state.timer_armed = false;
+        if state.pending_events == 0
+            || state.events.len() < self.minimum_requests
             || now.saturating_sub(state.last_dispatch) < 30
         {
             return;
@@ -92,6 +119,7 @@ impl IncidentReporter {
             .len();
         let start = state.events.front().map(|(at, _, _)| *at).unwrap_or(now);
         state.last_dispatch = now;
+        state.pending_events = 0;
         drop(state);
         let signal = json!({"site_id":self.site_id,"window_start":start.saturating_sub(1),
             "window_end":now,"total_requests":total,"bot_requests":bots,"unique_source_ips":unique});
@@ -529,6 +557,29 @@ async fn reload_model(
 mod tests {
     use super::*;
     use asd_detection::MODEL_FEATURE_NAMES;
+
+    #[tokio::test]
+    async fn throttled_burst_is_dispatched_after_traffic_stops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/incident", listener.local_addr().unwrap());
+        let reporter = IncidentReporter {
+            client: reqwest::Client::new(),
+            url,
+            key: "test-key".into(),
+            site_id: "test-site".into(),
+            window_seconds: 300,
+            minimum_requests: 1,
+            max_samples: 100,
+            state: Arc::new(Mutex::new(IncidentWindow {
+                last_dispatch: unix_seconds() as u64 - 29,
+                ..Default::default()
+            })),
+        };
+        reporter.record("198.51.100.1", true).await;
+        assert!(reporter.state.lock().await.timer_armed);
+        let accepted = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
+        assert!(accepted.is_ok(), "pending incident was never dispatched");
+    }
 
     fn temp_model_path(tag: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
