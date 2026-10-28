@@ -67,6 +67,12 @@ client IP outside local and configured trusted ranges, and a reason of at most
 
 Cloudflare is treated as an ingress/CDN boundary, not as a general outbound proxy. Ordinary model, payment, rules, and backend requests continue directly to their configured destinations, avoiding unnecessary Cloudflare traffic charges. When Cloudflare integration is enabled and the request/bot thresholds are exceeded, `config-recommender` returns an advisory to consider Under Attack Mode; it never changes the Cloudflare account automatically.
 
+### Distributed attack incident alerts
+
+Set the same `INCIDENT_EVALUATOR_API_KEY` on `escalation-engine` and `config-recommender`. Compose supplies `INCIDENT_EVALUATOR_URL`; set it to the authenticated `/incident/evaluate` endpoint when running outside Compose. Set `ADMIN_ALERT_WEBHOOK_URL` to deliver an operator alert, and optionally set `ADMIN_ALERT_WEBHOOK_BEARER_TOKEN` for its receiver. An empty evaluator URL, API key, or webhook URL disables the live alert path.
+
+The escalation engine aggregates suspicious decisions for `INCIDENT_MAX_WINDOW_SECONDS` (default 300) and caps memory with `INCIDENT_MAX_SAMPLES` (default 10,000). The evaluator requires `CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_REQUESTS` (default 100), `CLOUDFLARE_ATTACK_RECOMMENDATION_MIN_BOT_RATIO` (default 0.25), and `INCIDENT_MIN_UNIQUE_SOURCES` (default 20). It suppresses repeat alerts for `INCIDENT_ALERT_COOLDOWN_SECONDS` (default 900). Set `INCIDENT_PRIMARY_HEALTH_URL` and `INCIDENT_BACKUP_HEALTH_URL` to include a manual failover recommendation only if the primary is unhealthy and the backup is healthy. A Cloudflare recommendation is also manual; the services do not call the Cloudflare API or change routing. Window aggregation and cooldown are process-local, so use one replica of each service until shared incident state is added. Use synthetic traffic and a local webhook receiver for drills.
+
 Each service also accepts a `*_PORT` variable matching its package name in uppercase, for example `ESCALATION_ENGINE_PORT` or `RAG_TRAINER_PORT`. Security-event writers report persistence and malformed-record errors through structured logs instead of silently discarding them.
 
 ## Run One Service
