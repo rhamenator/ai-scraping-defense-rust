@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added authenticated incident evaluation, cooldown-limited admin webhook
+  alerts, and manual Cloudflare and health-gated failover guidance.
+
+### Security
+
+- Updated locked `ctutils` and `tokio` dependencies to resolve RustSec audit
+  findings.
+
 ## [0.1.1] - 2026-10-21
 
 ### Fixed
