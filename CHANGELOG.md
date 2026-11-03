@@ -2,10 +2,16 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-02
+
 ### Added
 
 - Added authenticated incident evaluation, cooldown-limited admin webhook
   alerts, and manual Cloudflare and health-gated failover guidance.
+
+### Changed
+
+- Updated Redis, OpenTelemetry, and release action pins while retaining Rust 1.88 compatibility.
 
 ### Security
 
