@@ -12,6 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class QuickstartTests(unittest.TestCase):
+    def test_services_that_hold_the_blocklist_receive_the_block_lifetime(self):
+        compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
+        holders = compose.count('REDIS_DB_BLOCKLIST: "0"')
+        passed = compose.count('BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"')
+        self.assertGreater(holders, 0)
+        self.assertEqual(holders, passed)
+
     def test_redis_and_postgres_clients_wait_for_healthy_backends(self):
         # Each service picks Redis/Postgres or a fallback once at startup, so a service that
         # starts before the backend accepts connections would run degraded for its lifetime.
