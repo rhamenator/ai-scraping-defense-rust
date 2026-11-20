@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- `config-recommender` `GET /recommendations` and `edge-ops` `GET /security/score` now require an operator key (`INCIDENT_EVALUATOR_API_KEY` or `EDGE_OPS_API_KEY`, or a valid JWT). They previously answered anonymously, disclosing the tarpit and block thresholds and acting as a scoring oracle (#69).
+
 ### Fixed
 
 - Docker Compose: the five Redis clients (escalation-engine, ai-service, admin-ui, public-blocklist, edge-ops) now wait for a healthy Redis. Previously a service that started first silently kept a private in-memory blocklist, so admin-ui could not see the engine's blocks (#67).

@@ -1,5 +1,6 @@
 use asd_core::{
-    env_string, env_u64, has_valid_api_key, health, observability_router, serve, ServiceConfig,
+    env_string, env_u64, has_valid_api_key, health, is_authorized, observability_router, serve,
+    ServiceConfig,
 };
 use axum::{
     extract::{Query, State},
@@ -198,7 +199,17 @@ struct RecommendationQuery {
     bot_requests: Option<u64>,
 }
 
-async fn recommendations(Query(query): Query<RecommendationQuery>) -> Json<serde_json::Value> {
+async fn recommendations(
+    headers: HeaderMap,
+    Query(query): Query<RecommendationQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // The baseline discloses the tarpit and block thresholds, so it needs an operator key.
+    if !is_authorized(&headers, "INCIDENT_EVALUATOR_API_KEY", "JWT_SECRET") {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"status":"error","message":"Unauthorized"})),
+        ));
+    }
     let total_requests = query.total_requests.unwrap_or_default();
     let bot_requests = query.bot_requests.unwrap_or_default();
     let cloudflare_enabled = cloudflare_enabled();
@@ -215,7 +226,7 @@ async fn recommendations(Query(query): Query<RecommendationQuery>) -> Json<serde
         minimum_bot_ratio,
     );
 
-    Json(json!({
+    Ok(Json(json!({
         "rate_limit_per_minute": 120,
         "escalation_threshold": 0.70,
         "tarpit_threshold": 0.82,
@@ -233,7 +244,7 @@ async fn recommendations(Query(query): Query<RecommendationQuery>) -> Json<serde
         } else {
             Vec::new()
         }
-    }))
+    })))
 }
 
 fn cloudflare_enabled() -> bool {
@@ -273,6 +284,12 @@ mod tests {
             origin_healthy(&client, "http://127.0.0.1:0/health").await,
             Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn recommendations_require_an_operator_key() {
+        let denied = recommendations(HeaderMap::new(), Query(RecommendationQuery::default())).await;
+        assert_eq!(denied.unwrap_err().0, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
