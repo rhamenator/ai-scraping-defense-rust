@@ -303,44 +303,44 @@ impl BlocklistState {
         }
     }
 
+    /// Redis is authoritative whenever it answers, so a block that expired or
+    /// was removed by another service is never revived from this process's
+    /// memory. The in-memory copy only serves while Redis is unreachable.
     pub async fn contains(&self, ip: &str) -> bool {
         let Some(ip) = normalize_client_ip(ip) else {
             return false;
         };
-        let remembered = self.blocked.read().await.get(&ip).copied();
-        if let Some(expiry) = remembered {
-            if block_is_live(&expiry) {
-                if let Some(client) = &self.redis {
-                    if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                        let remaining =
-                            expiry.map(|at| at.saturating_duration_since(Instant::now()));
-                        let key = self.block_key(&ip);
-                        let mut cmd = redis::cmd("SET");
-                        cmd.arg(&key).arg("blocked");
-                        if let Some(remaining) = remaining {
-                            cmd.arg("PX").arg(remaining.as_millis().max(1) as u64);
-                        }
-                        let _: redis::RedisResult<Option<String>> =
-                            cmd.arg("NX").query_async(&mut con).await;
-                    }
-                }
-                return true;
-            }
-            self.blocked.write().await.remove(&ip);
-        }
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<bool> = con.exists(self.block_key(&ip)).await;
-                if let Ok(value) = result {
-                    if value {
-                        let expiry = self.block_ttl.map(|ttl| Instant::now() + ttl);
-                        self.blocked.write().await.insert(ip.clone(), expiry);
+                let remaining_ms: redis::RedisResult<i64> = redis::cmd("PTTL")
+                    .arg(self.block_key(&ip))
+                    .query_async(&mut con)
+                    .await;
+                match remaining_ms {
+                    Ok(-2) => {
+                        self.blocked.write().await.remove(&ip);
+                        return false;
                     }
-                    return value;
+                    Ok(ms) => {
+                        let expiry = u64::try_from(ms)
+                            .ok()
+                            .map(|ms| Instant::now() + Duration::from_millis(ms));
+                        self.blocked.write().await.insert(ip, expiry);
+                        return true;
+                    }
+                    Err(_) => {}
                 }
             }
         }
-        false
+        let remembered = self.blocked.read().await.get(&ip).copied();
+        match remembered {
+            Some(expiry) if block_is_live(&expiry) => true,
+            Some(_) => {
+                self.blocked.write().await.remove(&ip);
+                false
+            }
+            None => false,
+        }
     }
 
     async fn redis_blocked(&self) -> Option<Vec<String>> {
