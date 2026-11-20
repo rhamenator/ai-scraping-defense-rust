@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Security
+
+- Update the locked quinn-udp dependency from 0.5.15 to 0.5.16 for
+  RUSTSEC-2026-0538; add a CI regression floor for the patched version ranges.
+
 ## [0.1.4] - 2026-11-02
 
 ### Added
