@@ -17,6 +17,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Guard patched dependency versions
         run: python3 scripts/test_dependency_floor.py
+      - name: Check sample environment and authenticated examples
+        shell: sh
+        run: |
+          python3 scripts/test_quickstart.py
+          set -a
+          . ./config/sample.env
+          test "$ADMIN_UI_WEBAUTHN_RP_NAME" = "AI Scraping Defense Admin"
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88
         with:
           components: rustfmt, clippy
