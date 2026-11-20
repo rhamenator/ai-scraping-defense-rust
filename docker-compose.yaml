@@ -15,6 +15,8 @@ services:
       ESCALATION_THROTTLE_THRESHOLD: "0.72"
       ESCALATION_TARPIT_THRESHOLD: "0.82"
       ESCALATION_BLOCK_THRESHOLD: "0.92"
+      SCRAPER_UA_BLOCKLIST: "${SCRAPER_UA_BLOCKLIST-scrapy,sqlmap,nikto,masscan,nmap,zgrab,gptbot,ccbot,claudebot,claude-web,google-extended,bytespider,petalbot,ahrefsbot,semrushbot,mj12bot,dotbot}"
+      SCRAPER_UA_ALLOWLIST: "${SCRAPER_UA_ALLOWLIST:-}"
       ROBOTS_TXT_PATH: "${ROBOTS_TXT_PATH:-config/robots.txt}"
       DETECTION_MODEL_PATH: "${DETECTION_MODEL_PATH:-/models/detection-model.json}"
       REDIS_HOST: redis

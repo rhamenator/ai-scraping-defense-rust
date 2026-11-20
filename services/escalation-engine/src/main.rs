@@ -4,8 +4,8 @@ use asd_core::{
     tenant_key, AuditStore, BlocklistState, ServiceConfig,
 };
 use asd_detection::{
-    decide_with_robots, load_trained_model, FrequencyFeatures, InMemoryFrequency, RequestMetadata,
-    RobotsPolicy, TrainedLinearModel,
+    decide_with_policy, load_trained_model, DetectionPolicy, FrequencyFeatures, InMemoryFrequency,
+    RequestMetadata, RobotsPolicy, ScraperPolicy, TrainedLinearModel, DEFAULT_SCRAPER_UAS,
 };
 use axum::{
     extract::State,
@@ -243,6 +243,7 @@ fn unix_seconds() -> f64 {
 struct AppState {
     config: ServiceConfig,
     robots: Arc<RobotsPolicy>,
+    scrapers: Arc<ScraperPolicy>,
     frequency: FrequencyStore,
     blocklist: BlocklistState,
     audit: AuditStore,
@@ -271,6 +272,11 @@ async fn main() -> anyhow::Result<()> {
     let robots_path = env_string("ROBOTS_TXT_PATH", "config/robots.txt");
     let robots = RobotsPolicy::from_path(&robots_path)
         .map_err(|error| anyhow::anyhow!("cannot load robots policy {robots_path}: {error}"))?;
+    let scrapers = ScraperPolicy::parse(
+        &env_string("SCRAPER_UA_BLOCKLIST", DEFAULT_SCRAPER_UAS),
+        &env_string("SCRAPER_UA_ALLOWLIST", ""),
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
     let pg = pg_connect_from_env().await.map(Arc::new);
     let model_path = std::env::var("DETECTION_MODEL_PATH")
         .ok()
@@ -288,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: config.clone(),
         robots: Arc::new(robots),
+        scrapers: Arc::new(scrapers),
         frequency: FrequencyStore::from_env().await,
         blocklist: BlocklistState::from_env().await?,
         audit: AuditStore::from_env(pg).await?,
@@ -324,7 +331,11 @@ async fn escalate(
     let freq = if state.robots.is_disallowed(
         metadata.path.as_deref().unwrap_or(""),
         metadata.user_agent.as_deref().unwrap_or(""),
-    ) {
+    ) || state
+        .scrapers
+        .blocked_token(metadata.user_agent.as_deref().unwrap_or(""))
+        .is_some()
+    {
         FrequencyFeatures::default()
     } else {
         state.frequency.record(&ip).await
@@ -334,14 +345,17 @@ async fn escalate(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let mut decision = decide_with_robots(
+    let mut decision = decide_with_policy(
         metadata,
         freq,
         state.config.throttle_threshold,
         state.config.tarpit_threshold,
         state.config.block_threshold,
         model.as_deref(),
-        &state.robots,
+        DetectionPolicy {
+            robots: &state.robots,
+            scrapers: &state.scrapers,
+        },
     );
     if decision.is_bot {
         state.bots.fetch_add(1, Ordering::Relaxed);
@@ -721,6 +735,7 @@ mod tests {
         let state = AppState {
             config,
             robots: Arc::new(RobotsPolicy::from_path(&policy_path).unwrap()),
+            scrapers: Arc::new(ScraperPolicy::default()),
             frequency: FrequencyStore {
                 memory: InMemoryFrequency::default(),
                 redis: None,
