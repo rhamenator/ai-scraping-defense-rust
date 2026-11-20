@@ -22,7 +22,7 @@ use redis::{AsyncCommands, IntoConnectionInfo, RedisConnectionInfo};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -30,6 +30,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -76,13 +77,41 @@ impl ServiceConfig {
     }
 }
 
-#[derive(Clone, Default)]
+/// Default block lifetime when `BLOCKLIST_TTL_SECONDS` is not set (24 hours).
+pub const DEFAULT_BLOCKLIST_TTL_SECONDS: u64 = 86_400;
+
+/// Blocks are stored one Redis key per address (`blocklist:<ip>`) with an
+/// expiry, so a block made in error or against a spoofed address cannot last
+/// forever. `BLOCKLIST_TTL_SECONDS=0` disables expiry.
+#[derive(Clone)]
 pub struct BlocklistState {
-    blocked: Arc<RwLock<HashSet<String>>>,
+    blocked: Arc<RwLock<HashMap<String, Option<Instant>>>>,
     flagged: Arc<RwLock<HashMap<String, String>>>,
     redis: Option<redis::Client>,
     blocklist_key: String,
     flag_prefix: String,
+    block_ttl: Option<Duration>,
+}
+
+impl Default for BlocklistState {
+    fn default() -> Self {
+        Self {
+            blocked: Arc::default(),
+            flagged: Arc::default(),
+            redis: None,
+            blocklist_key: String::new(),
+            flag_prefix: String::new(),
+            block_ttl: block_ttl_from_seconds(DEFAULT_BLOCKLIST_TTL_SECONDS),
+        }
+    }
+}
+
+fn block_ttl_from_seconds(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+fn block_is_live(expiry: &Option<Instant>) -> bool {
+    expiry.is_none_or(|at| at > Instant::now())
 }
 
 impl BlocklistState {
@@ -90,6 +119,10 @@ impl BlocklistState {
         let mut state = Self {
             blocklist_key: tenant_key("blocklist"),
             flag_prefix: tenant_key("ip_flag:"),
+            block_ttl: block_ttl_from_seconds(env_u64(
+                "BLOCKLIST_TTL_SECONDS",
+                DEFAULT_BLOCKLIST_TTL_SECONDS,
+            )),
             ..Self::default()
         };
         if env::var("REDIS_ENABLED")
@@ -121,6 +154,26 @@ impl BlocklistState {
         Ok(state)
     }
 
+    fn block_key(&self, ip: &str) -> String {
+        format!("{}:{ip}", self.blocklist_key)
+    }
+
+    async fn write_block(
+        con: &mut redis::aio::MultiplexedConnection,
+        key: &str,
+        reason: &str,
+        ttl: Option<Duration>,
+    ) -> redis::RedisResult<()> {
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg(reason);
+        if let Some(ttl) = ttl {
+            cmd.arg("EX").arg(ttl.as_secs());
+        }
+        cmd.query_async(con).await
+    }
+
+    /// Earlier releases kept blocks in one Redis set with no expiry. Move each
+    /// valid entry to its own expiring key and remove it from the set.
     async fn migrate_legacy_blocklist(
         &self,
         con: &mut redis::aio::MultiplexedConnection,
@@ -132,36 +185,58 @@ impl BlocklistState {
         }
         let mut migrated = 0usize;
         for (legacy, canonical) in migrations {
-            let _: (usize, usize) = redis::pipe()
-                .atomic()
-                .cmd("SADD")
-                .arg(&self.blocklist_key)
-                .arg(&canonical)
+            let mut pipe = redis::pipe();
+            pipe.atomic()
+                .cmd("SET")
+                .arg(self.block_key(&canonical))
+                .arg("blocked");
+            if let Some(ttl) = self.block_ttl {
+                pipe.arg("EX").arg(ttl.as_secs());
+            }
+            pipe.arg("NX")
+                .ignore()
                 .cmd("SREM")
                 .arg(&self.blocklist_key)
                 .arg(&legacy)
-                .query_async(con)
-                .await?;
+                .ignore();
+            pipe.query_async::<()>(con).await?;
             migrated += 1;
         }
         if migrated > 0 {
-            tracing::info!(migrated, "canonicalized persisted blocklist entries");
+            tracing::info!(
+                migrated,
+                "moved legacy blocklist set entries to expiring per-address keys"
+            );
         }
         Ok(())
     }
 
     pub async fn block(&self, ip: impl Into<String>) -> bool {
+        self.block_with_reason(ip, "blocked").await
+    }
+
+    /// Block an address and store why (the Redis value, as in the Python
+    /// edition). A repeat block refreshes the expiry.
+    pub async fn block_with_reason(&self, ip: impl Into<String>, reason: &str) -> bool {
+        let reason: String = reason.trim().chars().take(256).collect();
+        let reason = if reason.is_empty() {
+            "blocked".to_string()
+        } else {
+            reason
+        };
         let ip = ip.into();
         if !is_blockable_client_ip(&ip) {
             tracing::warn!(ip = %ip, "refusing to block an invalid or trusted infrastructure IP");
             return false;
         }
         let ip = normalize_client_ip(&ip).expect("validated IP address");
-        self.blocked.write().await.insert(ip.clone());
+        let expiry = self.block_ttl.map(|ttl| Instant::now() + ttl);
+        self.blocked.write().await.insert(ip.clone(), expiry);
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<usize> = con.sadd(&self.blocklist_key, &ip).await;
-                if let Err(exc) = result {
+                if let Err(exc) =
+                    Self::write_block(&mut con, &self.block_key(&ip), &reason, self.block_ttl).await
+                {
                     tracing::warn!(error = %exc, ip = %ip, "failed to persist block to Redis; in-memory block remains active");
                 }
             }
@@ -176,7 +251,7 @@ impl BlocklistState {
         self.blocked.write().await.remove(&ip);
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<usize> = con.srem(&self.blocklist_key, &ip).await;
+                let result: redis::RedisResult<usize> = con.del(self.block_key(&ip)).await;
                 if let Err(exc) = result {
                     tracing::warn!(error = %exc, ip, "failed to remove block from Redis; in-memory block was removed");
                 }
@@ -232,56 +307,79 @@ impl BlocklistState {
         let Some(ip) = normalize_client_ip(ip) else {
             return false;
         };
-        if self.blocked.read().await.contains(&ip) {
-            if let Some(client) = &self.redis {
-                if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                    let _: redis::RedisResult<usize> = con.sadd(&self.blocklist_key, &ip).await;
+        let remembered = self.blocked.read().await.get(&ip).copied();
+        if let Some(expiry) = remembered {
+            if block_is_live(&expiry) {
+                if let Some(client) = &self.redis {
+                    if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+                        let remaining =
+                            expiry.map(|at| at.saturating_duration_since(Instant::now()));
+                        let key = self.block_key(&ip);
+                        let mut cmd = redis::cmd("SET");
+                        cmd.arg(&key).arg("blocked");
+                        if let Some(remaining) = remaining {
+                            cmd.arg("PX").arg(remaining.as_millis().max(1) as u64);
+                        }
+                        let _: redis::RedisResult<Option<String>> =
+                            cmd.arg("NX").query_async(&mut con).await;
+                    }
                 }
+                return true;
             }
-            return true;
+            self.blocked.write().await.remove(&ip);
         }
         if let Some(client) = &self.redis {
             if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<bool> =
-                    con.sismember(&self.blocklist_key, &ip).await;
+                let result: redis::RedisResult<bool> = con.exists(self.block_key(&ip)).await;
                 if let Ok(value) = result {
                     if value {
-                        self.blocked.write().await.insert(ip.clone());
+                        let expiry = self.block_ttl.map(|ttl| Instant::now() + ttl);
+                        self.blocked.write().await.insert(ip.clone(), expiry);
                     }
                     return value;
                 }
             }
         }
-        self.blocked.read().await.contains(&ip)
+        false
     }
 
-    pub async fn blocked(&self) -> Vec<String> {
-        if let Some(client) = &self.redis {
-            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let result: redis::RedisResult<Vec<String>> =
-                    con.smembers(&self.blocklist_key).await;
-                if let Ok(mut entries) = result {
-                    entries.sort();
-                    return entries;
-                }
+    async fn redis_blocked(&self) -> Option<Vec<String>> {
+        let client = self.redis.as_ref()?;
+        let mut con = client.get_multiplexed_async_connection().await.ok()?;
+        let prefix = format!("{}:", self.blocklist_key);
+        let mut entries = Vec::new();
+        let mut scan = con
+            .scan_match::<_, String>(format!("{prefix}*"))
+            .await
+            .ok()?;
+        while let Some(Ok(key)) = scan.next_item().await {
+            if let Some(ip) = key.strip_prefix(&prefix) {
+                entries.push(ip.to_string());
             }
         }
-        let mut entries = self
-            .blocked
-            .read()
-            .await
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        entries.sort();
+        Some(entries)
+    }
+
+    async fn memory_blocked(&self) -> Vec<String> {
+        let mut blocked = self.blocked.write().await;
+        blocked.retain(|_, expiry| block_is_live(expiry));
+        let mut entries = blocked.keys().cloned().collect::<Vec<_>>();
         entries.sort();
         entries
     }
 
+    pub async fn blocked(&self) -> Vec<String> {
+        match self.redis_blocked().await {
+            Some(entries) => entries,
+            None => self.memory_blocked().await,
+        }
+    }
+
     pub async fn stats(&self) -> BlocklistStats {
         if let Some(client) = &self.redis {
-            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
-                let blocked_count: redis::RedisResult<usize> = con.scard(&self.blocklist_key).await;
-                if let Ok(blocked_count) = blocked_count {
+            if let Some(blocked) = self.redis_blocked().await {
+                if let Ok(mut con) = client.get_multiplexed_async_connection().await {
                     let pattern = format!("{}*", self.flag_prefix);
                     let flagged_count = match con.scan_match::<_, String>(pattern).await {
                         Ok(mut entries) => {
@@ -297,14 +395,14 @@ impl BlocklistState {
                         }
                     };
                     return BlocklistStats {
-                        blocked_count,
+                        blocked_count: blocked.len(),
                         flagged_count,
                     };
                 }
             }
         }
         BlocklistStats {
-            blocked_count: self.blocked.read().await.len(),
+            blocked_count: self.memory_blocked().await.len(),
             flagged_count: self.flagged.read().await.len(),
         }
     }
@@ -1040,9 +1138,8 @@ fn blocklist_migration_plan(entries: Vec<String>) -> (Vec<(String, String)>, Vec
     let mut invalid = Vec::new();
     for legacy in entries {
         match normalize_client_ip(&legacy) {
-            Some(canonical) if canonical != legacy => migrations.push((legacy, canonical)),
+            Some(canonical) => migrations.push((legacy, canonical)),
             None => invalid.push(legacy),
-            _ => {}
         }
     }
     (migrations, invalid)
@@ -1413,6 +1510,41 @@ mod tests {
         assert!(state.flagged.read().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn blocks_expire_after_the_configured_lifetime() {
+        let state = BlocklistState {
+            block_ttl: Some(Duration::from_millis(40)),
+            ..BlocklistState::default()
+        };
+        assert!(state.block("198.51.100.20").await);
+        assert!(state.contains("198.51.100.20").await);
+        assert_eq!(state.stats().await.blocked_count, 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!state.contains("198.51.100.20").await);
+        assert!(state.blocked().await.is_empty());
+        assert_eq!(state.stats().await.blocked_count, 0);
+    }
+
+    #[tokio::test]
+    async fn zero_lifetime_means_blocks_never_expire() {
+        assert_eq!(block_ttl_from_seconds(0), None);
+        let state = BlocklistState {
+            block_ttl: block_ttl_from_seconds(0),
+            ..BlocklistState::default()
+        };
+        assert!(state.block("198.51.100.21").await);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(state.contains("198.51.100.21").await);
+    }
+
+    #[test]
+    fn default_block_lifetime_is_twenty_four_hours() {
+        assert_eq!(
+            BlocklistState::default().block_ttl,
+            Some(Duration::from_secs(86_400))
+        );
+    }
+
     #[test]
     fn mapped_trusted_cidrs_keep_their_ipv4_scope() {
         let mapped = "::ffff:10.2.0.0/112";
@@ -1438,7 +1570,8 @@ mod tests {
             migrations,
             vec![
                 ("2001:0db8::1".into(), "2001:db8::1".into()),
-                ("::ffff:198.51.100.7".into(), "198.51.100.7".into())
+                ("::ffff:198.51.100.7".into(), "198.51.100.7".into()),
+                ("2001:db8::2".into(), "2001:db8::2".into())
             ]
         );
         assert_eq!(invalid, vec!["not-an-ip"]);

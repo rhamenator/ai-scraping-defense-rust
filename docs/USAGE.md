@@ -45,6 +45,7 @@ environment value consumed by Rust's `env_string` helper.
 Important settings:
 
 - `REDIS_HOST`, `REDIS_PORT`: Redis connection used by blocklist and frequency tracking.
+- `BLOCKLIST_TTL_SECONDS`: how long a block lasts before Redis expires it (default `86400`, 24 hours; the same setting and default as the Python edition, and the .NET edition's `BlockDurationMinutes` = 1440). Each block is its own Redis key, `blocklist:<ip>`, whose value is the reason. Blocking an address again restarts its expiry, and `POST /unblock` removes it at once. Set `0` to make blocks permanent. Blocks from older releases (a Redis set with no expiry) are moved to expiring keys at startup.
 - `POSTGRES_ENABLED`, `PG_HOST`, `PG_PORT`, `PG_DBNAME`, `PG_USER`, `PG_PASSWORD`: PostgreSQL connection used by persisted service state.
 - `AUDIT_STORAGE_BACKEND`: `auto` (default), `postgres`, `jsonl`, or `disabled`. `auto` uses PostgreSQL when connected and initializes a JSONL store at `AUDIT_JSONL_PATH` otherwise. Explicit PostgreSQL selection fails startup if the database is unavailable; invalid backend names also fail startup. The container image runs from the non-root user's writable home, so its default relative path resolves to `/home/appuser/data/security-events.jsonl`.
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: optional HTTP(S) OTLP/gRPC collector endpoint. When set, all shared-server HTTP spans are batch-exported with W3C `traceparent` extraction and flushed during process shutdown; malformed endpoints fail startup.

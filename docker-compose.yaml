@@ -28,6 +28,7 @@ services:
       REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
       REDIS_DB_FREQUENCY: "0"
       REDIS_DB_BLOCKLIST: "0"
+      BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"
       RUST_LOG: info
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
@@ -71,6 +72,7 @@ services:
       REDIS_HOST: redis
       REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
       REDIS_DB_BLOCKLIST: "0"
+      BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"
       RUST_LOG: info
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
@@ -113,6 +115,7 @@ services:
       REDIS_HOST: redis
       REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
       REDIS_DB_BLOCKLIST: "0"
+      BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"
       RUST_LOG: info
       POSTGRES_ENABLED: "true"
       PG_HOST: postgres
@@ -242,6 +245,7 @@ services:
       REDIS_HOST: redis
       REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
       REDIS_DB_BLOCKLIST: "0"
+      BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"
       RUST_LOG: info
     ports:
       - "8011:8011"
@@ -294,6 +298,7 @@ services:
       REDIS_HOST: redis
       REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
       REDIS_DB_BLOCKLIST: "0"
+      BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"
       REAL_BACKEND_HOST: "${REAL_BACKEND_HOST:-https://example.com}"
       RULES_URL: "${RULES_URL:-}"
       EDGE_ALLOWED_DOMAINS: "${EDGE_ALLOWED_DOMAINS:-}"

@@ -274,7 +274,15 @@ async fn block(
         return Err(unauthorized());
     }
     if let Some(ip) = action.ip {
-        if !state.blocklist.block(ip.clone()).await {
+        let block_reason = action
+            .reason
+            .as_deref()
+            .unwrap_or("manual block by operator");
+        if !state
+            .blocklist
+            .block_with_reason(ip.clone(), block_reason)
+            .await
+        {
             return Err(bad_request(
                 "IP is invalid or belongs to trusted proxy infrastructure",
             ));

@@ -366,7 +366,12 @@ async fn escalate(
         let incident_ip = ip.clone();
         tokio::spawn(async move { reporter.record(&incident_ip, bot).await });
     }
-    if decision.action == "block_ip" && ip != "unknown" && !state.blocklist.block(ip.clone()).await
+    if decision.action == "block_ip"
+        && ip != "unknown"
+        && !state
+            .blocklist
+            .block_with_reason(ip.clone(), &decision.reason)
+            .await
     {
         decision.action = "observe".to_string();
         decision.reason.push_str(
