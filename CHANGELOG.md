@@ -2,25 +2,29 @@
 
 ## [Unreleased]
 
-### Security
-
-- Update the locked quinn-udp dependency from 0.5.15 to 0.5.16 for
-  RUSTSEC-2026-0538; add a CI regression floor for the patched version ranges.
+## [0.1.5] - 2026-11-20
 
 ### Fixed
-
-- Quote the sample environment's multiword WebAuthn RP name, validate shell
-  sourcing in CI, and authenticate the documented escalation examples in both
-  PowerShell and curl. Explain loading generated API keys into the terminal.
-
-- Block configured scraper/scanner/AI-crawler product tokens on the first request,
-  with narrow configured exceptions that cannot bypass robots rules or exempt
-  other tool tokens. Remove bare bot/crawler matches from bad-UA classification.
 
 - Load the origin robots.txt into Rust escalation decisions; give violations
   +0.6 evidence and an independent block action that model output cannot dilute.
   Package/mount the policy and report robots violations separately from legacy
   sensitive-path hints.
+- Block configured scraper/scanner/AI-crawler product tokens on the first request,
+  with narrow configured exceptions that cannot bypass robots rules or exempt
+  other tool tokens. Remove bare bot/crawler matches from bad-UA classification.
+- Quote the sample environment's multiword WebAuthn RP name, validate shell
+  sourcing in CI, and authenticate the documented escalation examples in both
+  PowerShell and curl. Explain loading generated API keys into the terminal.
+
+### Changed
+
+- Updated compatible Rust dependencies.
+
+### Security
+
+- Update the locked quinn-udp dependency from 0.5.15 to 0.5.16 for
+  RUSTSEC-2026-0538; add a CI regression floor for the patched version ranges.
 
 ## [0.1.4] - 2026-11-02
 
