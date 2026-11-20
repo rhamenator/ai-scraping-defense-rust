@@ -7,6 +7,9 @@ x-cloudflare-env: &cloudflare-env
 services:
   escalation-engine:
     build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["/usr/local/bin/escalation-engine"]
     environment:
       <<: *cloudflare-env
@@ -53,6 +56,9 @@ services:
 
   ai-service:
     build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["/usr/local/bin/ai-service"]
     environment:
       <<: *cloudflare-env
@@ -88,6 +94,9 @@ services:
 
   admin-ui:
     build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["/usr/local/bin/admin-ui"]
     environment:
       <<: *cloudflare-env
@@ -210,6 +219,9 @@ services:
 
   public-blocklist:
     build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["/usr/local/bin/public-blocklist"]
     environment:
       <<: *cloudflare-env
@@ -254,6 +266,9 @@ services:
 
   edge-ops:
     build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["/usr/local/bin/edge-ops"]
     environment:
       <<: *cloudflare-env

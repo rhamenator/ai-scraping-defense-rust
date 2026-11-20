@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Docker Compose: the five Redis clients (escalation-engine, ai-service, admin-ui, public-blocklist, edge-ops) now wait for a healthy Redis. Previously a service that started first silently kept a private in-memory blocklist, so admin-ui could not see the engine's blocks (#67).
+
 ## [0.1.5] - 2026-11-20
 
 ### Fixed

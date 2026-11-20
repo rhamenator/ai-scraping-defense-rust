@@ -12,6 +12,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class QuickstartTests(unittest.TestCase):
+    def test_redis_clients_wait_for_a_healthy_redis(self):
+        # Each service picks Redis or an in-memory store once at startup, so a service that
+        # starts before Redis accepts connections would keep a private blocklist forever.
+        compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
+        blocks = re.split(r"(?m)^  (?=[a-z][a-z-]*:\n)", compose.split("\nservices:\n", 1)[1])
+        checked = 0
+        for block in blocks:
+            name = block.split(":", 1)[0]
+            if "REDIS_HOST: redis" in block:
+                checked += 1
+                self.assertRegex(
+                    block,
+                    r"depends_on:\n      redis:\n        condition: service_healthy",
+                    name,
+                )
+        self.assertGreaterEqual(checked, 5)
+
     @unittest.skipUnless(shutil.which("sh"), "POSIX shell unavailable")
     def test_sample_env_can_be_sourced_and_strips_value_quotes(self):
         result = subprocess.run(
