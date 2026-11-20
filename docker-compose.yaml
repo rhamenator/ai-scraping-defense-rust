@@ -8,6 +8,8 @@ services:
   escalation-engine:
     build: .
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     command: ["/usr/local/bin/escalation-engine"]
@@ -57,6 +59,8 @@ services:
   ai-service:
     build: .
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     command: ["/usr/local/bin/ai-service"]
@@ -79,6 +83,9 @@ services:
 
   tarpit-api:
     build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: ["/usr/local/bin/tarpit-api"]
     environment:
       TARPIT_API_PORT: "8003"
@@ -95,6 +102,8 @@ services:
   admin-ui:
     build: .
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     command: ["/usr/local/bin/admin-ui"]
@@ -239,6 +248,9 @@ services:
 
   pay-per-crawl:
     build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: ["/usr/local/bin/pay-per-crawl"]
     environment:
       PAY_PER_CRAWL_PORT: "8012"
@@ -267,6 +279,8 @@ services:
   edge-ops:
     build: .
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     command: ["/usr/local/bin/edge-ops"]
@@ -296,6 +310,9 @@ services:
 
   rag-trainer:
     build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: ["/usr/local/bin/rag-trainer"]
     environment:
       RAG_TRAINER_PORT: "8014"
@@ -347,6 +364,11 @@ services:
       POSTGRES_USER: "${PG_USER:-markovuser}"
       POSTGRES_PASSWORD: "${PG_PASSWORD:?Run python scripts/configure_credentials.py}"
       POSTGRES_DB: "${PG_DBNAME:-markovdb}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   detection-model:

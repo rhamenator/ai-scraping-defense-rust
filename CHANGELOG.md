@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Docker Compose: the five Redis clients (escalation-engine, ai-service, admin-ui, public-blocklist, edge-ops) now wait for a healthy Redis. Previously a service that started first silently kept a private in-memory blocklist, so admin-ui could not see the engine's blocks (#67).
+- Docker Compose: services now wait for a healthy Redis (escalation-engine, ai-service, admin-ui, public-blocklist, edge-ops) and a healthy Postgres (the seven services with `PG_HOST`; Postgres gained a `pg_isready` healthcheck). Previously a service that started first silently kept a private in-memory blocklist (so admin-ui could not see the engine's blocks) or ran without Postgres (for example the tarpit lost its corpus) (#67).
 
 ## [0.1.5] - 2026-11-20
 
