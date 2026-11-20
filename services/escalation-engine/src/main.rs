@@ -4,8 +4,8 @@ use asd_core::{
     tenant_key, AuditStore, BlocklistState, ServiceConfig,
 };
 use asd_detection::{
-    decide_with_model, load_trained_model, FrequencyFeatures, InMemoryFrequency, RequestMetadata,
-    TrainedLinearModel,
+    decide_with_robots, load_trained_model, FrequencyFeatures, InMemoryFrequency, RequestMetadata,
+    RobotsPolicy, TrainedLinearModel,
 };
 use axum::{
     extract::State,
@@ -242,6 +242,7 @@ fn unix_seconds() -> f64 {
 #[derive(Clone)]
 struct AppState {
     config: ServiceConfig,
+    robots: Arc<RobotsPolicy>,
     frequency: FrequencyStore,
     blocklist: BlocklistState,
     audit: AuditStore,
@@ -267,6 +268,9 @@ struct EscalationResponse {
 async fn main() -> anyhow::Result<()> {
     let _telemetry = asd_core::init_tracing("escalation-engine")?;
     let config = ServiceConfig::from_env("escalation-engine", 8002);
+    let robots_path = env_string("ROBOTS_TXT_PATH", "config/robots.txt");
+    let robots = RobotsPolicy::from_path(&robots_path)
+        .map_err(|error| anyhow::anyhow!("cannot load robots policy {robots_path}: {error}"))?;
     let pg = pg_connect_from_env().await.map(Arc::new);
     let model_path = std::env::var("DETECTION_MODEL_PATH")
         .ok()
@@ -283,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = AppState {
         config: config.clone(),
+        robots: Arc::new(robots),
         frequency: FrequencyStore::from_env().await,
         blocklist: BlocklistState::from_env().await?,
         audit: AuditStore::from_env(pg).await?,
@@ -316,19 +321,27 @@ async fn escalate(
     state.requests.fetch_add(1, Ordering::Relaxed);
     verify_tls_fingerprint(&mut metadata);
     let ip = metadata.ip.clone().unwrap_or_else(|| "unknown".to_string());
-    let freq = state.frequency.record(&ip).await;
+    let freq = if state.robots.is_disallowed(
+        metadata.path.as_deref().unwrap_or(""),
+        metadata.user_agent.as_deref().unwrap_or(""),
+    ) {
+        FrequencyFeatures::default()
+    } else {
+        state.frequency.record(&ip).await
+    };
     let model = state
         .model
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let mut decision = decide_with_model(
+    let mut decision = decide_with_robots(
         metadata,
         freq,
         state.config.throttle_threshold,
         state.config.tarpit_threshold,
         state.config.block_threshold,
         model.as_deref(),
+        &state.robots,
     );
     if decision.is_bot {
         state.bots.fetch_add(1, Ordering::Relaxed);
@@ -675,5 +688,104 @@ mod tests {
         // /admin/reload_model must never silently keep serving the previous
         // detector when told to load a path that isn't there.
         assert!(load_model(Some("definitely-does-not-exist.json")).is_err());
+    }
+    #[tokio::test]
+    async fn file_policy_reaches_authenticated_handler_blocklist_and_audit() {
+        struct RestoreKey(Option<std::ffi::OsString>);
+        impl Drop for RestoreKey {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("ESCALATION_API_KEY", value),
+                    None => std::env::remove_var("ESCALATION_API_KEY"),
+                }
+            }
+        }
+        let _restore = RestoreKey(std::env::var_os("ESCALATION_API_KEY"));
+        std::env::set_var("ESCALATION_API_KEY", "test-policy-key");
+        let policy_path = temp_model_path("robots-policy");
+        let audit_path = temp_model_path("robots-audit");
+        std::fs::write(
+            &policy_path,
+            "User-agent: *\nDisallow: /financial/\nAllow: /financial/public/\n",
+        )
+        .unwrap();
+        let config = ServiceConfig {
+            service_name: "escalation-engine".into(),
+            port: 8002,
+            webhook_shared_secret: None,
+            escalation_threshold: 0.70,
+            throttle_threshold: 0.72,
+            tarpit_threshold: 0.82,
+            block_threshold: 0.92,
+        };
+        let state = AppState {
+            config,
+            robots: Arc::new(RobotsPolicy::from_path(&policy_path).unwrap()),
+            frequency: FrequencyStore {
+                memory: InMemoryFrequency::default(),
+                redis: None,
+                key_prefix: "test:".into(),
+                window: Duration::from_secs(300),
+                ttl_seconds: 360,
+            },
+            blocklist: BlocklistState::default(),
+            audit: AuditStore::jsonl(&audit_path).await.unwrap(),
+            model: Arc::new(std::sync::RwLock::new(Some(Arc::new(TrainedLinearModel {
+                schema_version: 1,
+                algorithm: "logistic_regression".into(),
+                feature_names: asd_detection::MODEL_FEATURE_NAMES
+                    .map(str::to_string)
+                    .to_vec(),
+                weights: vec![0.0; asd_detection::MODEL_FEATURE_NAMES.len()],
+                bias: -40.0,
+            })))),
+            model_path: None,
+            requests: Arc::new(AtomicU64::new(0)),
+            bots: Arc::new(AtomicU64::new(0)),
+            incident: IncidentReporter {
+                client: reqwest::Client::new(),
+                url: String::new(),
+                key: String::new(),
+                site_id: "test".into(),
+                window_seconds: 300,
+                minimum_requests: 100,
+                max_samples: 100,
+                state: Arc::new(Mutex::new(IncidentWindow::default())),
+            },
+        };
+        let metadata = || RequestMetadata {
+            ip: Some("203.0.113.10".into()),
+            path: Some("/financial/reports".into()),
+            user_agent: Some("Firefox".into()),
+            referer: Some("https://example.test/".into()),
+            ..Default::default()
+        };
+        let rejected = escalate(State(state.clone()), HeaderMap::new(), Json(metadata())).await;
+        assert_eq!(rejected.err().unwrap().0, StatusCode::UNAUTHORIZED);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "test-policy-key".parse().unwrap());
+        let response = escalate(State(state.clone()), headers.clone(), Json(metadata()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response.action, "block_ip");
+        assert_eq!(response.features["robots_disallowed"], 1);
+        assert!(response.reason.contains("Robots.txt"));
+        assert!(state.blocklist.contains("203.0.113.10").await);
+        let mut allowed = metadata();
+        allowed.ip = Some("203.0.113.11".into());
+        allowed.path = Some("/financial/public/report".into());
+        let response = escalate(State(state.clone()), headers, Json(allowed))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response.action, "allow");
+        assert_eq!(response.features["robots_disallowed"], 0);
+        assert!(!state.blocklist.contains("203.0.113.11").await);
+        assert!(std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .contains("Robots.txt disallow violation"));
+        std::fs::remove_file(policy_path).unwrap();
+        std::fs::remove_file(audit_path).unwrap();
     }
 }

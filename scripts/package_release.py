@@ -62,6 +62,8 @@ def main() -> None:
     shutil.copy2(".github/assets/logo.png", logo)
     shutil.copy2("docs/USAGE.md", stage / "USAGE.md")
     shutil.copy2("config/sample.env", stage / "sample.env")
+    (stage / "config").mkdir(exist_ok=True)
+    shutil.copy2("config/robots.txt", stage / "config/robots.txt")
     shutil.copy2("Cargo.lock", stage / "Cargo.lock")
 
     if args.platform.startswith("windows-"):

@@ -1,0 +1,11 @@
+# Replace this example with the robots.txt served by the protected origin.
+User-agent: *
+Disallow: /admin$
+Disallow: /admin/
+Disallow: /internal$
+Disallow: /internal/
+Disallow: /.env
+Disallow: /wp-admin$
+Disallow: /wp-admin/
+Disallow: /wp-login.php
+Disallow: /xmlrpc.php

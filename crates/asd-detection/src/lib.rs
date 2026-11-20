@@ -1,3 +1,6 @@
+mod robots;
+pub use robots::RobotsPolicy;
+
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -83,7 +86,10 @@ pub struct ExtractedFeatures {
     pub path_is_root: u8,
     pub path_has_docs: u8,
     pub path_is_wp: u8,
+    /// Legacy normalized sensitive-path hint, separate from robots permission.
     pub path_disallowed: u8,
+    #[serde(default)]
+    pub robots_disallowed: u8,
     pub ua_is_known_bad: u8,
     pub ua_is_known_benign_crawler: u8,
     pub ua_is_empty: u8,
@@ -185,7 +191,20 @@ pub fn model_feature_vector(features: &ExtractedFeatures) -> [f64; 10] {
     ]
 }
 
+fn default_robots_policy() -> &'static RobotsPolicy {
+    static POLICY: std::sync::OnceLock<RobotsPolicy> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| RobotsPolicy::parse(include_str!("../../../config/robots.txt")))
+}
+
 pub fn extract_features(metadata: &RequestMetadata, freq: FrequencyFeatures) -> ExtractedFeatures {
+    extract_features_with_robots(metadata, freq, default_robots_policy())
+}
+
+pub fn extract_features_with_robots(
+    metadata: &RequestMetadata,
+    freq: FrequencyFeatures,
+    robots: &RobotsPolicy,
+) -> ExtractedFeatures {
     let ua = metadata.user_agent.as_deref().unwrap_or("");
     let ua_lower = ua.to_ascii_lowercase();
     let path = metadata.path.as_deref().unwrap_or("");
@@ -214,6 +233,7 @@ pub fn extract_features(metadata: &RequestMetadata, freq: FrequencyFeatures) -> 
                 || normalized_path.contains("/xmlrpc.php"),
         ),
         path_disallowed: u8::from(is_disallowed_path(path) || is_disallowed_path(normalized_path)),
+        robots_disallowed: u8::from(robots.is_disallowed(path, ua)),
         ua_is_known_bad: u8::from(KNOWN_BAD_UAS.iter().any(|needle| ua_lower.contains(needle))),
         ua_is_known_benign_crawler: u8::from(
             metadata.verified_bot.unwrap_or(false)
@@ -308,6 +328,7 @@ pub fn score(features: &ExtractedFeatures) -> f64 {
     score += 0.30 * f64::from(features.ua_is_known_bad);
     score += 0.18 * f64::from(features.ua_is_empty);
     score += 0.12 * f64::from(features.path_disallowed);
+    score += 0.60 * f64::from(features.robots_disallowed);
     score += 0.10 * f64::from(features.path_is_wp);
     score += 0.06 * f64::from(features.referer_is_empty);
     score += (features.request_frequency as f64 / 100.0).min(0.18);
@@ -348,17 +369,42 @@ pub fn decide_with_model(
     block_threshold: f64,
     model: Option<&TrainedLinearModel>,
 ) -> Decision {
+    decide_with_robots(
+        metadata,
+        freq,
+        throttle_threshold,
+        tarpit_threshold,
+        block_threshold,
+        model,
+        default_robots_policy(),
+    )
+}
+
+pub fn decide_with_robots(
+    metadata: RequestMetadata,
+    freq: FrequencyFeatures,
+    throttle_threshold: f64,
+    tarpit_threshold: f64,
+    block_threshold: f64,
+    model: Option<&TrainedLinearModel>,
+    robots: &RobotsPolicy,
+) -> Decision {
     let tls_ja3 = normalize_ja3(metadata.tls_ja3.as_deref());
     let tls_ja4 = normalize_ja4(metadata.tls_ja4.as_deref());
     let tls_fingerprint_source = (tls_ja3.is_some() || tls_ja4.is_some())
         .then(|| metadata.tls_fingerprint_source.clone())
         .flatten();
     let fingerprint = browser_fingerprint(&metadata);
-    let features = extract_features(&metadata, freq);
-    let score = model
-        .map(|trained| trained.predict(&features))
-        .unwrap_or_else(|| score(&features));
-    let action = if score >= block_threshold {
+    let features = extract_features_with_robots(&metadata, freq, robots);
+    let robots_violation = features.robots_disallowed == 1;
+    let score = if robots_violation {
+        score(&features).max(block_threshold.clamp(0.0, 1.0))
+    } else {
+        model
+            .map(|trained| trained.predict(&features))
+            .unwrap_or_else(|| score(&features))
+    };
+    let action = if robots_violation || score >= block_threshold {
         "block_ip"
     } else if score >= tarpit_threshold {
         "tarpit"
@@ -368,17 +414,21 @@ pub fn decide_with_model(
         "allow"
     };
     Decision {
-        is_bot: score >= throttle_threshold,
+        is_bot: robots_violation || score >= throttle_threshold,
         score,
         action: action.to_string(),
-        reason: format!(
-            "{} score {score:.2}",
-            if model.is_some() {
-                "Trained logistic-regression model"
-            } else {
-                "Heuristic"
-            }
-        ),
+        reason: if robots_violation {
+            "Robots.txt disallow violation".to_string()
+        } else {
+            format!(
+                "{} score {score:.2}",
+                if model.is_some() {
+                    "Trained logistic-regression model"
+                } else {
+                    "Heuristic"
+                }
+            )
+        },
         fingerprint,
         tls_ja3,
         tls_ja4,
@@ -664,5 +714,36 @@ mod tests {
         assert!(decision
             .reason
             .starts_with("Trained logistic-regression model"));
+    }
+    #[test]
+    fn robots_violation_alone_blocks_even_with_allowing_model() {
+        let model = TrainedLinearModel {
+            schema_version: 1,
+            algorithm: "logistic_regression".into(),
+            feature_names: MODEL_FEATURE_NAMES.map(str::to_string).to_vec(),
+            weights: vec![0.0; MODEL_FEATURE_NAMES.len()],
+            bias: -40.0,
+        };
+        for (ua, verified_bot) in [("Firefox", None), ("Googlebot/2.1", Some(true))] {
+            let decision = decide_with_model(
+                RequestMetadata {
+                    user_agent: Some(ua.into()),
+                    path: Some("/wp-admin".into()),
+                    referer: Some("https://example.test/".into()),
+                    verified_bot,
+                    ..Default::default()
+                },
+                FrequencyFeatures::default(),
+                0.72,
+                0.82,
+                0.92,
+                Some(&model),
+            );
+            println!(
+                "{ua} /wp-admin -> {} score={}",
+                decision.action, decision.score
+            );
+            assert_eq!(decision.action, "block_ip");
+        }
     }
 }

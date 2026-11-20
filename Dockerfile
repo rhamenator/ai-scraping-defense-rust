@@ -27,6 +27,8 @@ COPY --from=builder /app/target/release/public-blocklist /usr/local/bin/public-b
 COPY --from=builder /app/target/release/rag-trainer /usr/local/bin/rag-trainer
 COPY --from=builder /app/target/release/tarpit-api /usr/local/bin/tarpit-api
 
+COPY config/robots.txt /home/appuser/config/robots.txt
+
 WORKDIR /home/appuser
 USER appuser
 ENV RUST_LOG=info

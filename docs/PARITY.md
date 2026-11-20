@@ -55,3 +55,14 @@ runtime services.
    training artifact generation.
 4. Add fixture-level live replay tests for representative Python request bodies,
    beyond the current service health smoke script.
+
+## Robots enforcement
+
+The escalation engine loads `ROBOTS_TXT_PATH` at startup and enforces the actual
+file for every client. Robots violations add +0.6 evidence and independently
+block before frequency-store work or model scoring. The response distinguishes
+`robots_disallowed` from the legacy normalized sensitive-path feature, and names
+the primary trigger in `reason`. A rule-permitted path is not a violation merely
+because it looks sensitive. Both verified and unverified clients must respect
+their applicable rules. The authenticated edge-ops robots-fetch endpoint returns
+content; an operator must install that content as the engine's policy and restart.

@@ -7,6 +7,13 @@
 - Update the locked quinn-udp dependency from 0.5.15 to 0.5.16 for
   RUSTSEC-2026-0538; add a CI regression floor for the patched version ranges.
 
+### Fixed
+
+- Load the origin robots.txt into Rust escalation decisions; give violations
+  +0.6 evidence and an independent block action that model output cannot dilute.
+  Package/mount the policy and report robots violations separately from legacy
+  sensitive-path hints.
+
 ## [0.1.4] - 2026-11-02
 
 ### Added

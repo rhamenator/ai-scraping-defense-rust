@@ -56,7 +56,26 @@ routes admit up to 30 attempts per connecting IP each minute. If these services
 are behind a proxy, the limit applies to the proxy's connection address; set
 matching limits at the ingress for individual clients.
 
-Escalation scoring checks both the supplied request path and a normalized path
+The escalation engine loads the origin's published robots policy from
+`ROBOTS_TXT_PATH` (default `config/robots.txt`) once at startup. Replace the
+example file with the actual robots.txt served by your protected site, and
+restart the engine after policy updates. Compose mounts this file read-only;
+images and binary bundles include the example. Start native binaries from the
+repository/package root, or set an absolute policy path. Missing or unreadable
+policy files fail startup instead of inventing violations or silently omitting
+protection. The edge-ops fetch response is not installed automatically.
+
+`features.robots_disallowed` identifies a rule violation. Rules preserve path
+case, normalize unreserved percent encoding, keep encoded reserved delimiters
+distinct, support comments, allow precedence, wildcard/end anchors and agent
+groups, and leave `/robots.txt` accessible. A violation contributes **+0.6**
+heuristic evidence and independently triggers `block_ip`, with reason
+`Robots.txt disallow violation` and a score at least the configured block tier.
+A model prediction or a verified-crawler discount cannot override it. A request
+permitted by the applicable rules receives no robots penalty.
+
+The existing `path_disallowed` feature remains a separate sensitive-path hint
+for model compatibility; it does not declare a robots violation. Escalation scoring checks both the supplied request path and a normalized path
 with up to three percent-decoding passes, backslash and repeated-slash
 normalization, dot-segment removal, and ASCII case folding. Paths longer than
 8192 bytes retain only the raw-path check. The `verified_bot` field in request
