@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-20
+
 ### Security
 
 - `config-recommender` `GET /recommendations` and `edge-ops` `GET /security/score` now require an operator key (`INCIDENT_EVALUATOR_API_KEY` or `EDGE_OPS_API_KEY`, or a valid JWT). They previously answered anonymously, disclosing the tarpit and block thresholds and acting as a scoring oracle (#69).
