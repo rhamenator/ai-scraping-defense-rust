@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-20
+
 ### Changed
 
 - Blocks now expire. Each block is stored as its own Redis key, `blocklist:<ip>`, with an expiry of `BLOCKLIST_TTL_SECONDS` (default 86400, 24 hours; the same setting and default as the Python edition, and the .NET edition's 1440 minutes). The key's value is the reason for the block. Blocking an address again restarts its expiry, `POST /unblock` still removes it immediately, and `BLOCKLIST_TTL_SECONDS=0` keeps blocks permanent. Previously blocks lived in a Redis set with no expiry, so a block made in error or against a spoofed address lasted until an operator found it. Entries left in the old set by earlier releases are moved to expiring keys when a service starts, which means they now expire after the configured lifetime too. The admin and escalation engines record the reason for each block.
