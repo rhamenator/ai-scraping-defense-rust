@@ -88,3 +88,7 @@ rustup toolchain install 1.88.0-x86_64-pc-windows-msvc
 ## License
 
 This project is licensed under the GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
+
+For authenticated API examples, export the configured API keys into your current
+terminal. The credential helper writes `.env` without changing the parent
+shell; see [configuration and shell loading](docs/USAGE.md#configuration).

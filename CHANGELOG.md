@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- Quote the sample environment's multiword WebAuthn RP name, validate shell
+  sourcing in CI, and authenticate the documented escalation examples in both
+  PowerShell and curl. Explain loading generated API keys into the terminal.
+
 - Block configured scraper/scanner/AI-crawler product tokens on the first request,
   with narrow configured exceptions that cannot bypass robots rules or exempt
   other tool tokens. Remove bare bot/crawler matches from bad-UA classification.
