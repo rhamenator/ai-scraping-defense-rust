@@ -215,7 +215,12 @@ async fn sync_blocklist(
     ))
 }
 
-async fn security_score(Query(query): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+async fn security_score(
+    request_headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Scoring on request is a detector oracle for anyone who can reach the port.
+    require_edge_admin(&request_headers)?;
     let mut headers = HashMap::new();
     if let Some(accept) = query.get("accept") {
         headers.insert("accept".to_string(), accept.clone());
@@ -245,12 +250,12 @@ async fn security_score(Query(query): Query<HashMap<String, String>>) -> Json<se
         ..Default::default()
     };
     let decision = decide(metadata, FrequencyFeatures::default(), 0.7, 0.82, 0.92);
-    Json(json!({
+    Ok(Json(json!({
         "status":"success",
         "score": decision.score,
         "action": decision.action,
         "reason": decision.reason
-    }))
+    })))
 }
 
 fn robots_url(url: &str) -> Option<String> {
@@ -404,6 +409,12 @@ fn default_robots() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn security_score_requires_an_operator_key() {
+        let denied = security_score(HeaderMap::new(), Query(HashMap::new())).await;
+        assert_eq!(denied.unwrap_err().0, StatusCode::UNAUTHORIZED);
+    }
 
     #[test]
     fn url_validation_rejects_private_and_lookalike_hosts() {

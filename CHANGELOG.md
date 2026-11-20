@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Security
+
+- `config-recommender` `GET /recommendations` and `edge-ops` `GET /security/score` now require an operator key (`INCIDENT_EVALUATOR_API_KEY` or `EDGE_OPS_API_KEY`, or a valid JWT). They previously answered anonymously, disclosing the tarpit and block thresholds and acting as a scoring oracle (#69).
+
+### Fixed
+
+- Docker Compose: services now wait for a healthy Redis (escalation-engine, ai-service, admin-ui, public-blocklist, edge-ops) and a healthy Postgres (the seven services with `PG_HOST`; Postgres gained a `pg_isready` healthcheck). Previously a service that started first silently kept a private in-memory blocklist (so admin-ui could not see the engine's blocks) or ran without Postgres (for example the tarpit lost its corpus) (#67).
+
 ## [0.1.5] - 2026-11-20
 
 ### Fixed
