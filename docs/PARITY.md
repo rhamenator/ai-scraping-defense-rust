@@ -66,3 +66,8 @@ the primary trigger in `reason`. A rule-permitted path is not a violation merely
 because it looks sensitive. Both verified and unverified clients must respect
 their applicable rules. The authenticated edge-ops robots-fetch endpoint returns
 content; an operator must install that content as the engine's policy and restart.
+
+The Rust engine also ships explicit first-request scraper/scanner/AI-crawler
+blocking. `SCRAPER_UA_BLOCKLIST` and `SCRAPER_UA_ALLOWLIST` configure product-token
+policy. These are separate from identity verification and never override robots
+enforcement. Generic HTTP clients retain soft heuristic treatment.

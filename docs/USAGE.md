@@ -261,3 +261,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## License
 
 AI Scraping Defense Rust is licensed under the GNU General Public License v3.0 or later. See [../LICENSE](../LICENSE).
+
+## Default scraper enforcement
+
+Known scraper/scanner/AI-crawler **product tokens** (including Scrapy, sqlmap and
+GPTBot) select `block_ip` on the first request, even without history or a model.
+The response names the matched token. Models and crawler credit cannot dilute
+this trigger. A bare `bot`/`crawler` substring is never sufficient for it;
+Googlebot and Bingbot claims alone grant no trusted identity either.
+
+`SCRAPER_UA_BLOCKLIST` configures comma-separated case-insensitive product tokens;
+`SCRAPER_UA_ALLOWLIST` exempts named tokens from this UA trigger. For example,
+`SCRAPER_UA_ALLOWLIST=gptbot` permits a configured GPTBot exception. An exception
+removes that token's bad-UA signal, does not exempt other tokens in the same UA,
+and does not disable robots rules or other behavioral/model checks. Invalid
+product-token syntax fails startup. An explicitly empty blocklist disables this
+UA trigger. Defaults are listed in `config/sample.env`.
+
+Generic curl, wget and python-requests clients retain ordinary soft heuristics;
+they are not hard-blocked solely by this default scraper-token policy. Install
+the origin's robots policy first: a robots violation always takes priority,
+including for allowlisted UA tokens and verified crawlers.

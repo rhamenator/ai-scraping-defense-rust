@@ -1,5 +1,18 @@
 mod robots;
+mod scrapers;
 pub use robots::RobotsPolicy;
+pub use scrapers::{ScraperPolicy, DEFAULT_SCRAPER_UAS};
+
+#[derive(Clone, Copy)]
+pub struct DetectionPolicy<'a> {
+    pub robots: &'a RobotsPolicy,
+    pub scrapers: &'a ScraperPolicy,
+}
+
+fn default_scraper_policy() -> &'static ScraperPolicy {
+    static POLICY: std::sync::OnceLock<ScraperPolicy> = std::sync::OnceLock::new();
+    POLICY.get_or_init(ScraperPolicy::default)
+}
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,18 +28,8 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-const KNOWN_BAD_UAS: &[&str] = &[
-    "python-requests",
-    "scrapy",
-    "curl",
-    "wget",
-    "httpclient",
-    "masscan",
-    "nikto",
-    "sqlmap",
-    "bot",
-    "crawler",
-];
+// Generic clients remain soft evidence; known tools/crawlers use explicit tokens.
+const KNOWN_BAD_UAS: &[&str] = &["python-requests", "curl", "wget", "httpclient"];
 
 const KNOWN_BENIGN_CRAWLERS: &[&str] =
     &["googlebot", "bingbot", "duckduckbot", "slurp", "applebot"];
@@ -205,6 +208,21 @@ pub fn extract_features_with_robots(
     freq: FrequencyFeatures,
     robots: &RobotsPolicy,
 ) -> ExtractedFeatures {
+    extract_features_with_policy(
+        metadata,
+        freq,
+        DetectionPolicy {
+            robots,
+            scrapers: default_scraper_policy(),
+        },
+    )
+}
+
+pub fn extract_features_with_policy(
+    metadata: &RequestMetadata,
+    freq: FrequencyFeatures,
+    policy: DetectionPolicy<'_>,
+) -> ExtractedFeatures {
     let ua = metadata.user_agent.as_deref().unwrap_or("");
     let ua_lower = ua.to_ascii_lowercase();
     let path = metadata.path.as_deref().unwrap_or("");
@@ -233,8 +251,11 @@ pub fn extract_features_with_robots(
                 || normalized_path.contains("/xmlrpc.php"),
         ),
         path_disallowed: u8::from(is_disallowed_path(path) || is_disallowed_path(normalized_path)),
-        robots_disallowed: u8::from(robots.is_disallowed(path, ua)),
-        ua_is_known_bad: u8::from(KNOWN_BAD_UAS.iter().any(|needle| ua_lower.contains(needle))),
+        robots_disallowed: u8::from(policy.robots.is_disallowed(path, ua)),
+        ua_is_known_bad: u8::from(
+            KNOWN_BAD_UAS.iter().any(|needle| ua_lower.contains(needle))
+                || policy.scrapers.blocked_token(ua).is_some(),
+        ),
         ua_is_known_benign_crawler: u8::from(
             metadata.verified_bot.unwrap_or(false)
                 && KNOWN_BENIGN_CRAWLERS
@@ -389,22 +410,49 @@ pub fn decide_with_robots(
     model: Option<&TrainedLinearModel>,
     robots: &RobotsPolicy,
 ) -> Decision {
+    decide_with_policy(
+        metadata,
+        freq,
+        throttle_threshold,
+        tarpit_threshold,
+        block_threshold,
+        model,
+        DetectionPolicy {
+            robots,
+            scrapers: default_scraper_policy(),
+        },
+    )
+}
+
+pub fn decide_with_policy(
+    metadata: RequestMetadata,
+    freq: FrequencyFeatures,
+    throttle_threshold: f64,
+    tarpit_threshold: f64,
+    block_threshold: f64,
+    model: Option<&TrainedLinearModel>,
+    policy: DetectionPolicy<'_>,
+) -> Decision {
     let tls_ja3 = normalize_ja3(metadata.tls_ja3.as_deref());
     let tls_ja4 = normalize_ja4(metadata.tls_ja4.as_deref());
     let tls_fingerprint_source = (tls_ja3.is_some() || tls_ja4.is_some())
         .then(|| metadata.tls_fingerprint_source.clone())
         .flatten();
     let fingerprint = browser_fingerprint(&metadata);
-    let features = extract_features_with_robots(&metadata, freq, robots);
+    let features = extract_features_with_policy(&metadata, freq, policy);
     let robots_violation = features.robots_disallowed == 1;
-    let score = if robots_violation {
+    let blocked_scraper = policy
+        .scrapers
+        .blocked_token(metadata.user_agent.as_deref().unwrap_or(""));
+    let primary_block = robots_violation || blocked_scraper.is_some();
+    let score = if primary_block {
         score(&features).max(block_threshold.clamp(0.0, 1.0))
     } else {
         model
             .map(|trained| trained.predict(&features))
             .unwrap_or_else(|| score(&features))
     };
-    let action = if robots_violation || score >= block_threshold {
+    let action = if primary_block || score >= block_threshold {
         "block_ip"
     } else if score >= tarpit_threshold {
         "tarpit"
@@ -414,11 +462,13 @@ pub fn decide_with_robots(
         "allow"
     };
     Decision {
-        is_bot: robots_violation || score >= throttle_threshold,
+        is_bot: primary_block || score >= throttle_threshold,
         score,
         action: action.to_string(),
         reason: if robots_violation {
             "Robots.txt disallow violation".to_string()
+        } else if let Some(token) = blocked_scraper {
+            format!("Configured scraper User-Agent token: {token}")
         } else {
             format!(
                 "{} score {score:.2}",
@@ -745,5 +795,93 @@ mod tests {
             );
             assert_eq!(decision.action, "block_ip");
         }
+    }
+    #[test]
+    fn default_scraper_tokens_block_on_first_permitted_request() {
+        let mut failures = 0;
+        for ua in ["Scrapy/2.11", "sqlmap/1.7", "GPTBot/1.2"] {
+            let decision = decide(
+                RequestMetadata {
+                    path: Some("/articles/1".into()),
+                    user_agent: Some(ua.into()),
+                    ..Default::default()
+                },
+                FrequencyFeatures::default(),
+                0.72,
+                0.82,
+                0.92,
+            );
+            println!(
+                "{ua} /articles/1 -> {} score={}",
+                decision.action, decision.score
+            );
+            failures += usize::from(decision.action != "block_ip");
+        }
+        assert_eq!(failures, 0, "all configured scraper tokens must block");
+    }
+    #[test]
+    fn scraper_allowlist_is_narrow_and_never_bypasses_robots() {
+        let robots = RobotsPolicy::parse("User-agent: *\nDisallow: /private\n");
+        let scrapers = ScraperPolicy::parse("gptbot,sqlmap,acmecollector", "GPTBot").unwrap();
+        for (ua, path, expected) in [
+            ("GPTBot/1.2", "/articles/1", "allow"),
+            ("GPTBot/1.2 sqlmap/1.7", "/articles/1", "block_ip"),
+            ("GPTBot/1.2", "/private/report", "block_ip"),
+            ("AcmeCollector/1.0", "/pricing", "block_ip"),
+            ("Googlebot/2.1", "/pricing", "allow"),
+            ("Bingbot/2.0", "/pricing", "allow"),
+            ("Firefox", "/pricing", "allow"),
+        ] {
+            let decision = decide_with_policy(
+                RequestMetadata {
+                    user_agent: Some(ua.into()),
+                    path: Some(path.into()),
+                    ..Default::default()
+                },
+                FrequencyFeatures::default(),
+                0.72,
+                0.82,
+                0.92,
+                None,
+                DetectionPolicy {
+                    robots: &robots,
+                    scrapers: &scrapers,
+                },
+            );
+            assert_eq!(decision.action, expected, "{ua} {path}");
+            if expected == "allow" {
+                assert_eq!(decision.features.ua_is_known_bad, 0, "{ua}");
+                assert_eq!(decision.features.robots_disallowed, 0, "{path}");
+            }
+            if path.starts_with("/private") {
+                assert!(decision.reason.starts_with("Robots.txt"));
+            }
+        }
+    }
+
+    #[test]
+    fn scraper_token_cannot_be_diluted_by_model_or_verified_crawler_credit() {
+        let model = TrainedLinearModel {
+            schema_version: 1,
+            algorithm: "logistic_regression".into(),
+            feature_names: MODEL_FEATURE_NAMES.map(str::to_string).to_vec(),
+            weights: vec![0.0; MODEL_FEATURE_NAMES.len()],
+            bias: -40.0,
+        };
+        let decision = decide_with_model(
+            RequestMetadata {
+                user_agent: Some("sqlmap/1.7 Googlebot/2.1".into()),
+                verified_bot: Some(true),
+                path: Some("/pricing".into()),
+                ..Default::default()
+            },
+            FrequencyFeatures::default(),
+            0.72,
+            0.82,
+            0.92,
+            Some(&model),
+        );
+        assert_eq!(decision.action, "block_ip");
+        assert!(decision.reason.contains("sqlmap"));
     }
 }

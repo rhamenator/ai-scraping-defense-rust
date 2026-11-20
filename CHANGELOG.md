@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- Block configured scraper/scanner/AI-crawler product tokens on the first request,
+  with narrow configured exceptions that cannot bypass robots rules or exempt
+  other tool tokens. Remove bare bot/crawler matches from bad-UA classification.
+
 - Load the origin robots.txt into Rust escalation decisions; give violations
   +0.6 evidence and an independent block action that model output cannot dilute.
   Package/mount the policy and report robots violations separately from legacy
