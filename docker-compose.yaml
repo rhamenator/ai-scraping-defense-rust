@@ -15,6 +15,7 @@ services:
       ESCALATION_THROTTLE_THRESHOLD: "0.72"
       ESCALATION_TARPIT_THRESHOLD: "0.82"
       ESCALATION_BLOCK_THRESHOLD: "0.92"
+      ROBOTS_TXT_PATH: "${ROBOTS_TXT_PATH:-config/robots.txt}"
       DETECTION_MODEL_PATH: "${DETECTION_MODEL_PATH:-/models/detection-model.json}"
       REDIS_HOST: redis
       REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
@@ -44,6 +45,7 @@ services:
     # POST /admin/reload_model without copying artifacts between containers.
     volumes:
       - detection-model:/models
+      - ./config/robots.txt:/home/appuser/config/robots.txt:ro
     ports:
       - "8002:8002"
 
