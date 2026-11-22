@@ -228,7 +228,8 @@ async fn logs(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn plugins() -> Json<serde_json::Value> {
-    Json(json!({"plugins":[],"dynamic_plugins":false}))
+    // There is no plugin system in the Rust edition: the list is genuinely empty and cannot be edited.
+    Json(json!({"plugins":[],"dynamic_plugins":false,"editable":false}))
 }
 
 async fn metrics_json(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -249,12 +250,12 @@ async fn update_plugins(
     }
     record_security_event(
         &state.audit,
-        "admin_update_plugins",
+        "admin_update_plugins_unsupported",
         "admin",
-        json!({"plugins":[]}),
+        json!({}),
     )
     .await;
-    Ok(Json(json!({"status":"success","plugins":[]})))
+    Err(not_implemented("plugins"))
 }
 
 async fn block_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -507,16 +508,22 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Json<serde
     Json(json!({"status":"success"}))
 }
 
-async fn operation_blocklist_sync(State(state): State<AppState>) -> Json<serde_json::Value> {
-    operation_queued(state, "blocklist-sync").await
+async fn operation_blocklist_sync(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    operation_unsupported(state, "blocklist-sync").await
 }
 
-async fn operation_rules_fetch(State(state): State<AppState>) -> Json<serde_json::Value> {
-    operation_queued(state, "rules-fetch").await
+async fn operation_rules_fetch(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    operation_unsupported(state, "rules-fetch").await
 }
 
-async fn operation_robots_fetch(State(state): State<AppState>) -> Json<serde_json::Value> {
-    operation_queued(state, "robots-fetch").await
+async fn operation_robots_fetch(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    operation_unsupported(state, "robots-fetch").await
 }
 
 fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
@@ -834,15 +841,31 @@ fn totp_code(secret: &[u8], counter: u64) -> String {
     format!("{:06}", binary % 1_000_000)
 }
 
-async fn operation_queued(state: AppState, operation: &str) -> Json<serde_json::Value> {
+/// Admin operations that nothing executes yet answer 501, so a success or queued reply always means the work
+/// happened. The attempt is still audited, under a name that does not claim anything was queued.
+async fn operation_unsupported(
+    state: AppState,
+    operation: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
     record_security_event(
         &state.audit,
-        "admin_operation_queued",
+        "admin_operation_unsupported",
         "admin",
         json!({"operation":operation}),
     )
     .await;
-    Json(json!({"status":"queued","operation":operation}))
+    not_implemented(operation)
+}
+
+fn not_implemented(operation: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "status": "not_implemented",
+            "operation": operation,
+            "message": "This admin operation is not implemented in the Rust edition yet; nothing was run."
+        })),
+    )
 }
 
 fn internal_error(message: String) -> (StatusCode, Json<serde_json::Value>) {
@@ -865,5 +888,44 @@ mod mfa_rate_tests {
         }
         assert!(!admit_mfa_attempt(&attempts, peer).await);
         assert!(admit_mfa_attempt(&attempts, "192.0.2.2".parse().unwrap()).await);
+    }
+}
+
+#[cfg(test)]
+mod honest_operation_tests {
+    use super::*;
+
+    #[test]
+    fn unimplemented_operations_answer_501_and_never_claim_success() {
+        for operation in ["blocklist-sync", "rules-fetch", "robots-fetch", "plugins"] {
+            let (status, Json(body)) = not_implemented(operation);
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(body["status"], "not_implemented");
+            assert_eq!(body["operation"], operation);
+            assert!(body["message"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was run"));
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_listing_says_it_is_empty_and_not_editable() {
+        let Json(body) = plugins().await;
+        assert_eq!(body["plugins"], json!([]));
+        assert_eq!(body["editable"], false);
+        assert_eq!(body["dynamic_plugins"], false);
+    }
+
+    #[test]
+    fn no_handler_still_reports_queued_or_empty_success() {
+        // Guards against the original defect (#83): a handler that audits an event nothing consumes and replies
+        // "queued" or "success". The check reads this file with the test module removed, so it cannot match itself.
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("admin_operation_queued"));
+        assert!(!production.contains("operation_queued"));
+        assert!(!production.contains("\"status\":\"queued\",\"operation\""));
+        assert!(!production.contains("\"status\":\"success\",\"plugins\""));
     }
 }
