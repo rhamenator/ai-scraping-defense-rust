@@ -38,6 +38,7 @@ struct AppState {
     passkeys: Arc<webauthn::PasskeyService>,
     mfa_attempts: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
     sessions: SessionStore,
+    gdpr: asd_core::gdpr::GdprConfig,
 }
 
 const SESSION_COOKIE: &str = "asd_admin_session";
@@ -75,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         passkeys,
         mfa_attempts: Arc::new(Mutex::new(HashMap::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        // A mistyped setting stops startup instead of silently changing what a deletion request does.
+        gdpr: asd_core::gdpr::GdprConfig::from_env()?,
     };
     ensure_admin_auth_tables(state.pg.as_deref()).await?;
     let app = Router::new()
@@ -329,19 +332,144 @@ async fn unblock(
     }
 }
 
-async fn gdpr_deletion(State(state): State<AppState>) -> Json<serde_json::Value> {
-    record_security_event(
-        &state.audit,
-        "gdpr_deletion_requested",
-        "admin",
-        json!({"processor":"ai-scraping-defense-rust"}),
-    )
-    .await;
-    Json(json!({"status":"queued","request":"gdpr-deletion"}))
+#[derive(Deserialize)]
+struct DeletionRequest {
+    ip: Option<String>,
 }
 
-async fn gdpr_report() -> Json<serde_json::Value> {
-    Json(json!({"status":"ok","processor":"ai-scraping-defense-rust","records":[]}))
+/// Handles a data-subject erasure request for one IP address, as configured by `GDPR_ERASURE_MODE` and
+/// `GDPR_ACTIVE_BLOCK_POLICY`. The request record keeps a hash of the address, never the address itself.
+async fn gdpr_deletion(
+    State(state): State<AppState>,
+    Json(request): Json<DeletionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use asd_core::gdpr::ErasureMode;
+
+    let Some(ip) = request
+        .ip
+        .as_deref()
+        .and_then(asd_core::normalize_subject_ip)
+    else {
+        return Err(bad_request(
+            "ip is required and must be a valid IP address: the address the data subject connected from",
+        ));
+    };
+    let config = state.gdpr;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let subject_hash = asd_core::gdpr::subject_hash(&ip);
+
+    if config.mode == ErasureMode::Manual {
+        record_security_event(
+            &state.audit,
+            "gdpr_erasure_recorded",
+            "admin",
+            json!({"request_id": request_id, "subject_hash": subject_hash, "mode": "manual"}),
+        )
+        .await;
+        return Ok(Json(json!({
+            "status": "recorded",
+            "request_id": request_id,
+            "subject_hash": subject_hash,
+            "mode": config.mode.as_str(),
+            "message": "Recorded for manual handling; nothing was erased automatically."
+        })));
+    }
+
+    let subject = state
+        .blocklist
+        .erase_subject(&ip, config.active_block_policy)
+        .await;
+    let events = state.audit.erase_subject_events(&ip, config.mode).await;
+    let (events_changed, events_failed) = match events {
+        Ok(count) => (count, false),
+        Err(exc) => {
+            tracing::error!(error = %exc, "erasure of stored security events failed");
+            (0, true)
+        }
+    };
+    let retained = matches!(
+        subject.block,
+        asd_core::BlockErasure::RetainedUntilExpiry { .. }
+    );
+    let status = if events_failed {
+        "partial"
+    } else if retained {
+        "completed_with_retention"
+    } else {
+        "completed"
+    };
+    let result = json!({
+        "status": status,
+        "request_id": request_id,
+        "subject_hash": subject_hash,
+        "mode": config.mode.as_str(),
+        "active_block_policy": config.active_block_policy.as_str(),
+        "results": {
+            "block": subject.block,
+            "flag_removed": subject.flag_removed,
+            "security_events": {
+                "action": if config.mode == ErasureMode::Delete { "deleted" } else { "redacted" },
+                "events_changed": events_changed,
+                "failed": events_failed
+            }
+        }
+    });
+    // Recorded after the erasure, and carrying only the hash, so the record itself holds no personal data.
+    record_security_event(
+        &state.audit,
+        "gdpr_erasure_completed",
+        "admin",
+        result.clone(),
+    )
+    .await;
+    Ok(Json(result))
+}
+
+/// What the service holds and has done about erasure requests: real counts, not a placeholder.
+async fn gdpr_report(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stats = state.blocklist.stats().await;
+    let events = load_security_events(&state.audit, 10_000).await;
+    let requests: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "gdpr_erasure_completed" | "gdpr_erasure_recorded"
+            )
+        })
+        .collect();
+    let recent: Vec<_> = requests
+        .iter()
+        .take(20)
+        .map(|event| {
+            json!({
+                "request_id": event.payload["request_id"],
+                "subject_hash": event.payload["subject_hash"],
+                "status": event.payload.get("status").cloned().unwrap_or(json!("recorded")),
+                "mode": event.payload["mode"],
+                "at": event.created_at
+            })
+        })
+        .collect();
+    let stored_events = state.audit.count_events().await.ok();
+    Json(json!({
+        "status": "ok",
+        "processor": "ai-scraping-defense-rust",
+        "policy": {
+            "erasure_mode": state.gdpr.mode.as_str(),
+            "active_block_policy": state.gdpr.active_block_policy.as_str()
+        },
+        "data_held": {
+            "blocked_addresses": stats.blocked_count,
+            "flagged_addresses": stats.flagged_count,
+            "security_events": stored_events,
+            "audit_backend": state.audit.backend_name()
+        },
+        "erasure_requests": {
+            "total": requests.len(),
+            "recent": recent
+        }
+    }))
 }
 
 async fn sso_user(
@@ -1134,7 +1262,7 @@ mod browser_session_tests {
     use axum::{body::Body, routing::get};
     use tower::ServiceExt;
 
-    const KEY: &str = "test-admin-key-for-browser-sessions";
+    pub(super) const KEY: &str = "test-admin-key-for-browser-sessions";
 
     fn use_test_key() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1145,17 +1273,33 @@ mod browser_session_tests {
     }
 
     async fn test_state() -> AppState {
+        test_state_with(AuditStore::Disabled, asd_core::gdpr::GdprConfig::default()).await
+    }
+
+    async fn test_state_with(audit: AuditStore, gdpr: asd_core::gdpr::GdprConfig) -> AppState {
         use_test_key();
         AppState {
             config: ServiceConfig::from_env("admin-ui", 8004),
             blocklist: BlocklistState::default(),
             pg: None,
-            audit: AuditStore::Disabled,
+            audit,
+            gdpr,
             oidc: oidc::OidcVerifier::from_env().unwrap(),
             passkeys: Arc::new(webauthn::PasskeyService::from_env().unwrap()),
             mfa_attempts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(super) fn app_for_tests(state: AppState) -> Router {
+        app(state)
+    }
+
+    pub(super) async fn state_for_tests(
+        audit: AuditStore,
+        gdpr: asd_core::gdpr::GdprConfig,
+    ) -> AppState {
+        test_state_with(audit, gdpr).await
     }
 
     fn app(state: AppState) -> Router {
@@ -1169,6 +1313,7 @@ mod browser_session_tests {
             .route("/mfa/totp/setup", post(mfa_totp_setup))
             .route("/plugins", get(plugins).post(update_plugins))
             .route("/gdpr/deletion-request", post(gdpr_deletion))
+            .route("/gdpr/compliance-report", get(gdpr_report))
             .route("/passkey/register", post(webauthn_register_begin))
             .route("/webauthn/register/begin", post(webauthn_register_begin))
             .route(
@@ -1181,6 +1326,16 @@ mod browser_session_tests {
                 require_admin_middleware,
             ))
             .with_state(state)
+    }
+
+    pub(super) async fn call_for_tests(
+        app: &Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        call(app, method, path, headers, body).await
     }
 
     async fn call(
@@ -1567,5 +1722,248 @@ mod browser_session_tests {
         ] {
             assert!(!page.contains(forbidden), "page must not use {forbidden}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gdpr_erasure_tests {
+    use super::browser_session_tests::{app_for_tests, call_for_tests, KEY};
+    use super::*;
+    use asd_core::gdpr::{ActiveBlockPolicy, ErasureMode, GdprConfig};
+
+    const SUBJECT: &str = "203.0.113.7";
+
+    async fn jsonl_store() -> (AuditStore, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("asd-admin-gdpr-{}.jsonl", uuid::Uuid::new_v4()));
+        (AuditStore::jsonl(&path).await.unwrap(), path)
+    }
+
+    async fn seeded(config: GdprConfig) -> (Router, AppState, std::path::PathBuf) {
+        let (audit, path) = jsonl_store().await;
+        record_security_event(
+            &audit,
+            "admin_block_ip",
+            "admin",
+            json!({"ip": SUBJECT, "reason": "scraper"}),
+        )
+        .await;
+        record_security_event(
+            &audit,
+            "tarpit_hit",
+            "system",
+            json!({"client": format!("seen {SUBJECT} twice")}),
+        )
+        .await;
+        record_security_event(
+            &audit,
+            "tarpit_hit",
+            "system",
+            json!({"client": "198.51.100.1"}),
+        )
+        .await;
+        let state = browser_session_state(audit, config).await;
+        assert!(state.blocklist.block_with_reason(SUBJECT, "scraper").await);
+        assert!(state.blocklist.flag(SUBJECT, "suspicious").await);
+        (app_for_tests(state.clone()), state, path)
+    }
+
+    async fn browser_session_state(audit: AuditStore, config: GdprConfig) -> AppState {
+        super::browser_session_tests::state_for_tests(audit, config).await
+    }
+
+    async fn erase(app: &Router, ip: &str) -> (StatusCode, serde_json::Value) {
+        let (status, _, body) = call_for_tests(
+            app,
+            "POST",
+            "/gdpr/deletion-request",
+            &[("x-api-key", KEY)],
+            Some(json!({"ip": ip})),
+        )
+        .await;
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_redacts_events_erases_the_flag_and_keeps_an_active_block_until_it_expires(
+    ) {
+        let (app, state, path) = seeded(GdprConfig::default()).await;
+
+        let (status, body) = erase(&app, SUBJECT).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "completed_with_retention");
+        assert_eq!(body["mode"], "redact");
+        assert_eq!(body["results"]["flag_removed"], true);
+        assert_eq!(body["results"]["block"]["action"], "retained_until_expiry");
+        assert!(
+            body["results"]["block"]["seconds_remaining"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(body["results"]["security_events"]["events_changed"], 2);
+        assert!(
+            state.blocklist.contains(SUBJECT).await,
+            "the active block is kept under the default policy"
+        );
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !raw.contains(SUBJECT),
+            "no stored event or request record may contain the address: {raw}"
+        );
+        assert!(raw.contains("[erased]") && raw.contains("198.51.100.1"));
+        assert!(!body.to_string().contains(SUBJECT));
+        assert_eq!(body["subject_hash"], asd_core::gdpr::subject_hash(SUBJECT));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn erase_now_with_delete_removes_the_block_and_the_events() {
+        let config = GdprConfig {
+            mode: ErasureMode::Delete,
+            active_block_policy: ActiveBlockPolicy::EraseNow,
+        };
+        let (app, state, path) = seeded(config).await;
+
+        let (status, body) = erase(&app, SUBJECT).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["results"]["block"]["action"], "erased");
+        assert_eq!(body["results"]["security_events"]["action"], "deleted");
+        assert!(!state.blocklist.contains(SUBJECT).await);
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!raw.contains(SUBJECT) && !raw.contains("[erased]"));
+        assert!(raw.contains("198.51.100.1"), "unrelated events stay");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn manual_mode_only_records_the_request() {
+        let config = GdprConfig {
+            mode: ErasureMode::Manual,
+            ..GdprConfig::default()
+        };
+        let (app, state, path) = seeded(config).await;
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+
+        let (status, body) = erase(&app, SUBJECT).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "recorded");
+        assert!(body["message"].as_str().unwrap().contains("manual"));
+        assert!(state.blocklist.contains(SUBJECT).await);
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(after.starts_with(&before), "existing events are untouched");
+        assert!(after.contains("gdpr_erasure_recorded"));
+        assert!(
+            !after.replace(&before, "").contains(SUBJECT),
+            "the new record holds no address"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_invalid_address_is_rejected_and_changes_nothing() {
+        let (app, state, path) = seeded(GdprConfig::default()).await;
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+        for body in [
+            json!({}),
+            json!({"ip": "not an ip"}),
+            json!({"ip": ""}),
+            json!({"ip": 7}),
+        ] {
+            let (status, _, _) = call_for_tests(
+                &app,
+                "POST",
+                "/gdpr/deletion-request",
+                &[("x-api-key", KEY)],
+                Some(body),
+            )
+            .await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+                "{status}"
+            );
+        }
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), before);
+        assert!(state.blocklist.contains(SUBJECT).await);
+        let (status, _, _) = call_for_tests(
+            &app,
+            "POST",
+            "/gdpr/deletion-request",
+            &[],
+            Some(json!({"ip": SUBJECT})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn erasing_an_address_that_is_not_held_still_completes_and_is_recorded() {
+        let (app, _state, path) = seeded(GdprConfig::default()).await;
+
+        let (status, body) = erase(&app, "192.0.2.200").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["results"]["block"]["action"], "not_blocked");
+        assert_eq!(body["results"]["security_events"]["events_changed"], 0);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn the_compliance_report_shows_real_counts_policy_and_requests_without_addresses() {
+        let config = GdprConfig {
+            mode: ErasureMode::Redact,
+            active_block_policy: ActiveBlockPolicy::EraseNow,
+        };
+        let (app, _state, path) = seeded(config).await;
+        let (_, _, empty) = call_for_tests(
+            &app,
+            "GET",
+            "/gdpr/compliance-report",
+            &[("x-api-key", KEY)],
+            None,
+        )
+        .await;
+        assert_eq!(empty["erasure_requests"]["total"], 0);
+        assert_eq!(empty["data_held"]["blocked_addresses"], 1);
+        assert_eq!(empty["data_held"]["security_events"], 3);
+        assert_eq!(empty["policy"]["erasure_mode"], "redact");
+        assert_eq!(empty["policy"]["active_block_policy"], "erase_now");
+        assert_eq!(empty["data_held"]["audit_backend"], "jsonl");
+
+        let (_, answer) = erase(&app, SUBJECT).await;
+        let (status, report) = {
+            let (status, _, body) = call_for_tests(
+                &app,
+                "GET",
+                "/gdpr/compliance-report",
+                &[("x-api-key", KEY)],
+                None,
+            )
+            .await;
+            (status, body)
+        };
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["erasure_requests"]["total"], 1);
+        assert_eq!(
+            report["erasure_requests"]["recent"][0]["request_id"],
+            answer["request_id"]
+        );
+        assert_eq!(
+            report["erasure_requests"]["recent"][0]["status"],
+            "completed"
+        );
+        assert_eq!(report["data_held"]["blocked_addresses"], 0);
+        assert!(!report.to_string().contains(SUBJECT));
+        let (status, _, _) =
+            call_for_tests(&app, "GET", "/gdpr/compliance-report", &[], None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Configurable data-subject erasure (#83 follow-up). `POST /gdpr/deletion-request` now takes `{"ip": "<address>"}` and actually erases: the flag, the block (kept until it expires by default, or removed at once), and the address in stored security events (redacted by default, or the events deleted), as set by `GDPR_ERASURE_MODE` (`redact`, `delete`, `manual`) and `GDPR_ACTIVE_BLOCK_POLICY` (`retain_until_expiry`, `erase_now`). `manual` only records the request. The request record keeps a hash of the address, never the address. `GET /gdpr/compliance-report` reports the policy, real counts and recent requests instead of an empty list. **Behaviour change:** the deletion endpoint used to answer `queued` to any request and do nothing; it now requires `ip` and answers 400 without one. A mistyped `GDPR_*` value stops startup. Unverified against a live PostgreSQL; the JSONL audit store, the blocklist and the endpoints are tested.
+
 ### Security
 
 - Update `url` to 2.5.9 (and `form_urlencoded` to 1.2.3) to fix RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on deeply nested `blob:` URLs. Lockfile-only change.

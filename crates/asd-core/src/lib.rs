@@ -1,3 +1,5 @@
+pub mod gdpr;
+
 use anyhow::Context as _;
 use axum::{
     extract::{connect_info::IntoMakeServiceWithConnectInfo, Request},
@@ -83,6 +85,24 @@ pub const DEFAULT_BLOCKLIST_TTL_SECONDS: u64 = 86_400;
 /// Blocks are stored one Redis key per address (`blocklist:<ip>`) with an
 /// expiry, so a block made in error or against a spoofed address cannot last
 /// forever. `BLOCKLIST_TTL_SECONDS=0` disables expiry.
+/// What happened to a subject's block during an erasure request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum BlockErasure {
+    NotBlocked,
+    Erased,
+    /// Kept under the policy until it expires; `None` means it has no expiry.
+    RetainedUntilExpiry {
+        seconds_remaining: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SubjectErasure {
+    pub block: BlockErasure,
+    pub flag_removed: bool,
+}
+
 #[derive(Clone)]
 pub struct BlocklistState {
     blocked: Arc<RwLock<HashMap<String, Option<Instant>>>>,
@@ -285,6 +305,61 @@ impl BlocklistState {
             }
         }
         true
+    }
+
+    /// Erases what this service holds about one address for a data-subject request: the flag always, and the block
+    /// according to `policy` (kept until it expires, or removed now). Reports what happened to each.
+    pub async fn erase_subject(&self, ip: &str, policy: gdpr::ActiveBlockPolicy) -> SubjectErasure {
+        let Some(ip) = normalize_client_ip(ip) else {
+            return SubjectErasure {
+                block: BlockErasure::NotBlocked,
+                flag_removed: false,
+            };
+        };
+        let flag_removed = self.flagged.read().await.contains_key(&ip);
+        self.unflag(&ip).await;
+
+        // Redis is authoritative whenever it answers; the in-memory map only serves while it is unreachable.
+        let mut remaining: Option<Option<u64>> = None; // Some(None) = blocked without an expiry
+        if let Some(client) = &self.redis {
+            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+                let ttl: redis::RedisResult<i64> = redis::cmd("TTL")
+                    .arg(self.block_key(&ip))
+                    .query_async(&mut con)
+                    .await;
+                match ttl {
+                    Ok(-2) => remaining = None,
+                    Ok(-1) => remaining = Some(None),
+                    Ok(seconds) => remaining = Some(Some(seconds as u64)),
+                    Err(_) => {}
+                }
+            }
+        }
+        if remaining.is_none() {
+            let now = Instant::now();
+            if let Some(expiry) = self.blocked.read().await.get(&ip) {
+                if block_is_live(expiry) {
+                    remaining = Some(expiry.map(|at| at.saturating_duration_since(now).as_secs()));
+                }
+            }
+        }
+
+        let block = match (remaining, policy) {
+            (None, _) => BlockErasure::NotBlocked,
+            (Some(_), gdpr::ActiveBlockPolicy::EraseNow) => {
+                self.allow(&ip).await;
+                BlockErasure::Erased
+            }
+            (Some(seconds), gdpr::ActiveBlockPolicy::RetainUntilExpiry) => {
+                BlockErasure::RetainedUntilExpiry {
+                    seconds_remaining: seconds,
+                }
+            }
+        };
+        SubjectErasure {
+            block,
+            flag_removed,
+        }
     }
 
     pub async fn unflag(&self, ip: &str) {
@@ -1128,6 +1203,11 @@ pub fn is_blockable_client_ip(candidate: &str) -> bool {
     )
 }
 
+/// The canonical form of an address, or `None` when it is not a valid IP.
+pub fn normalize_subject_ip(candidate: &str) -> Option<String> {
+    normalize_client_ip(candidate)
+}
+
 fn normalize_client_ip(candidate: &str) -> Option<String> {
     let ip = candidate.parse::<std::net::IpAddr>().ok()?;
     Some(canonical_ip_addr(ip).to_string())
@@ -1387,6 +1467,102 @@ impl AuditStore {
         Ok(())
     }
 
+    /// Redacts or removes every stored event that mentions `ip` as a whole address, and returns how many events changed.
+    pub async fn erase_subject_events(
+        &self,
+        ip: &str,
+        mode: gdpr::ErasureMode,
+    ) -> anyhow::Result<u64> {
+        if mode == gdpr::ErasureMode::Manual {
+            return Ok(0);
+        }
+        match self {
+            Self::Postgres(pg) => {
+                let rows = pg
+                    .query(
+                        "SELECT id, payload FROM security_events WHERE position($1 in payload::text) > 0",
+                        &[&ip],
+                    )
+                    .await?;
+                let mut changed = 0;
+                for row in rows {
+                    let id: i64 = row.get(0);
+                    let mut payload: serde_json::Value = row.get(1);
+                    if !gdpr::mentions_subject(&payload, ip) {
+                        continue;
+                    }
+                    match mode {
+                        gdpr::ErasureMode::Delete => {
+                            pg.execute("DELETE FROM security_events WHERE id = $1", &[&id])
+                                .await?;
+                        }
+                        _ => {
+                            gdpr::redact_subject(&mut payload, ip);
+                            pg.execute(
+                                "UPDATE security_events SET payload = $1 WHERE id = $2",
+                                &[&payload, &id],
+                            )
+                            .await?;
+                        }
+                    }
+                    changed += 1;
+                }
+                Ok(changed)
+            }
+            Self::Jsonl { path, write_lock } => {
+                let _guard = write_lock.lock().await;
+                let contents = tokio::fs::read_to_string(path.as_ref()).await?;
+                let mut output = String::with_capacity(contents.len());
+                let mut changed = 0;
+                for line in contents.lines() {
+                    match serde_json::from_str::<SecurityEvent>(line) {
+                        Ok(mut event) if gdpr::mentions_subject(&event.payload, ip) => {
+                            changed += 1;
+                            if mode == gdpr::ErasureMode::Delete {
+                                continue;
+                            }
+                            gdpr::redact_subject(&mut event.payload, ip);
+                            output.push_str(&serde_json::to_string(&event)?);
+                            output.push('\n');
+                        }
+                        // everything else, including a malformed or blank line, is written back untouched
+                        _ => {
+                            output.push_str(line);
+                            output.push('\n');
+                        }
+                    }
+                }
+                if changed > 0 {
+                    let temporary = path.with_extension("jsonl.erasing");
+                    tokio::fs::write(&temporary, output).await?;
+                    tokio::fs::rename(&temporary, path.as_ref()).await?;
+                }
+                Ok(changed)
+            }
+            Self::Disabled => Ok(0),
+        }
+    }
+
+    /// How many security events are stored, for the compliance report.
+    pub async fn count_events(&self) -> anyhow::Result<u64> {
+        match self {
+            Self::Postgres(pg) => {
+                let row = pg
+                    .query_one("SELECT count(*) FROM security_events", &[])
+                    .await?;
+                Ok(row.get::<_, i64>(0) as u64)
+            }
+            Self::Jsonl { path, .. } => {
+                let contents = tokio::fs::read_to_string(path.as_ref()).await?;
+                Ok(contents
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count() as u64)
+            }
+            Self::Disabled => Ok(0),
+        }
+    }
+
     async fn load(&self, limit: i64) -> anyhow::Result<Vec<SecurityEvent>> {
         let limit = limit.clamp(1, 10_000);
         match self {
@@ -1482,6 +1658,211 @@ pub struct IpAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn temp_audit_store() -> (AuditStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("asd-gdpr-{}.jsonl", uuid::Uuid::new_v4()));
+        (AuditStore::jsonl(&path).await.unwrap(), path)
+    }
+
+    #[tokio::test]
+    async fn jsonl_erasure_redacts_only_whole_address_matches_and_keeps_everything_else() {
+        let (store, path) = temp_audit_store().await;
+        record_security_event(
+            &store,
+            "admin_block_ip",
+            "admin",
+            serde_json::json!({"ip": "203.0.113.7", "reason": "scraper"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "tarpit_hit",
+            "system",
+            serde_json::json!({"client": "seen 203.0.113.7 twice", "path": "/x"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "tarpit_hit",
+            "system",
+            serde_json::json!({"client": "203.0.113.70"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "admin_unblock_ip",
+            "admin",
+            serde_json::json!({"ip": "198.51.100.1"}),
+        )
+        .await;
+        // a malformed line must survive untouched
+        let mut contents = tokio::fs::read_to_string(&path).await.unwrap();
+        contents.push_str("not json at all\n");
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let changed = store
+            .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Redact)
+            .await
+            .unwrap();
+
+        assert_eq!(changed, 2);
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!raw.contains("\"203.0.113.7\""));
+        assert!(!raw.contains("seen 203.0.113.7"));
+        assert!(raw.contains("[erased]"));
+        assert!(
+            raw.contains("203.0.113.70"),
+            "a longer address must be left alone"
+        );
+        assert!(raw.contains("198.51.100.1"));
+        assert!(raw.contains("not json at all"));
+        let events = load_security_events(&store, 100).await;
+        assert_eq!(events.len(), 4, "redaction keeps every event");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "admin_block_ip"
+                && event.payload["ip"] == "[erased]"
+                && event.payload["reason"] == "scraper"));
+        assert!(
+            !path.with_extension("jsonl.erasing").exists(),
+            "the temporary file is renamed away"
+        );
+        assert_eq!(
+            store
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Redact)
+                .await
+                .unwrap(),
+            0,
+            "idempotent"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn jsonl_deletion_removes_matching_events_and_manual_mode_touches_nothing() {
+        let (store, path) = temp_audit_store().await;
+        record_security_event(
+            &store,
+            "a",
+            "admin",
+            serde_json::json!({"ip": "203.0.113.7"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "b",
+            "admin",
+            serde_json::json!({"ip": "203.0.113.8"}),
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Manual)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.count_events().await.unwrap(), 2);
+
+        assert_eq!(
+            store
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Delete)
+                .await
+                .unwrap(),
+            1
+        );
+        let remaining = load_security_events(&store, 10).await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].payload["ip"], "203.0.113.8");
+        assert_eq!(store.count_events().await.unwrap(), 1);
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(
+            AuditStore::Disabled
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Redact)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(AuditStore::Disabled.count_events().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_active_block_is_kept_until_expiry_or_erased_now_according_to_the_policy() {
+        let state = BlocklistState::default();
+        assert!(state.block_with_reason("203.0.113.7", "scraper").await);
+        assert!(state.flag("203.0.113.7", "suspicious").await);
+
+        let kept = state
+            .erase_subject("203.0.113.7", gdpr::ActiveBlockPolicy::RetainUntilExpiry)
+            .await;
+
+        assert!(kept.flag_removed, "the flag is always erased");
+        match kept.block {
+            BlockErasure::RetainedUntilExpiry {
+                seconds_remaining: Some(seconds),
+            } => {
+                assert!(
+                    seconds > 80_000 && seconds <= DEFAULT_BLOCKLIST_TTL_SECONDS,
+                    "{seconds}"
+                );
+            }
+            other => panic!("expected a retained block with an expiry, got {other:?}"),
+        }
+        assert!(state.contains("203.0.113.7").await);
+
+        let erased = state
+            .erase_subject("203.0.113.7", gdpr::ActiveBlockPolicy::EraseNow)
+            .await;
+
+        assert_eq!(erased.block, BlockErasure::Erased);
+        assert!(!erased.flag_removed, "the flag was already gone");
+        assert!(!state.contains("203.0.113.7").await);
+    }
+
+    #[tokio::test]
+    async fn erasing_an_unknown_or_invalid_subject_reports_nothing_to_erase() {
+        let state = BlocklistState::default();
+        let unknown = state
+            .erase_subject("203.0.113.9", gdpr::ActiveBlockPolicy::EraseNow)
+            .await;
+        assert_eq!(
+            unknown,
+            SubjectErasure {
+                block: BlockErasure::NotBlocked,
+                flag_removed: false
+            }
+        );
+        let invalid = state
+            .erase_subject("not an ip", gdpr::ActiveBlockPolicy::EraseNow)
+            .await;
+        assert_eq!(invalid.block, BlockErasure::NotBlocked);
+        assert_eq!(
+            normalize_subject_ip("2001:0db8:0:0:0:0:0:1").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(normalize_subject_ip("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn a_block_without_an_expiry_is_reported_as_such() {
+        let state = BlocklistState {
+            block_ttl: None,
+            ..BlocklistState::default()
+        };
+        assert!(state.block_with_reason("203.0.113.7", "permanent").await);
+
+        let report = state
+            .erase_subject("203.0.113.7", gdpr::ActiveBlockPolicy::RetainUntilExpiry)
+            .await;
+
+        assert_eq!(
+            report.block,
+            BlockErasure::RetainedUntilExpiry {
+                seconds_remaining: None
+            }
+        );
+    }
 
     #[tokio::test]
     async fn blocklist_uses_canonical_ip_addresses() {
