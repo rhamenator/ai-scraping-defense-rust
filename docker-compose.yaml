@@ -88,8 +88,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     command: ["/usr/local/bin/tarpit-api"]
     environment:
+      <<: *cloudflare-env
       TARPIT_API_PORT: "8003"
       RUST_LOG: info
       POSTGRES_ENABLED: "true"
@@ -98,6 +101,14 @@ services:
       PG_DBNAME: "${PG_DBNAME:-markovdb}"
       PG_USER: "${PG_USER:-markovuser}"
       PG_PASSWORD: "${PG_PASSWORD:?Run python scripts/configure_credentials.py}"
+      REDIS_HOST: redis
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Run python scripts/configure_credentials.py}"
+      REDIS_DB_BLOCKLIST: "0"
+      BLOCKLIST_TTL_SECONDS: "${BLOCKLIST_TTL_SECONDS:-86400}"
+      TAR_PIT_MAX_HOPS: "${TAR_PIT_MAX_HOPS:-250}"
+      TAR_PIT_HOP_WINDOW_SECONDS: "${TAR_PIT_HOP_WINDOW_SECONDS:-86400}"
+      ESCALATION_ENDPOINT: "http://escalation-engine:8002/escalate"
+      ESCALATION_API_KEY: "${ESCALATION_API_KEY:-}"
     ports:
       - "8003:8003"
 

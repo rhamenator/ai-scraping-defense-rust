@@ -1,6 +1,6 @@
 [package]
 name = "tarpit-api"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,5 +10,9 @@ anyhow.workspace = true
 asd-core = { path = "../../crates/asd-core" }
 asd-tarpit = { path = "../../crates/asd-tarpit" }
 axum.workspace = true
+redis.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tracing.workspace = true

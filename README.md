@@ -15,6 +15,8 @@ Implemented baseline services:
 - `escalation-engine`: `/escalate`, `/metrics`, `/admin/reload_plugins`
 - `ai-service`: `/health`, `/webhook`
 - `tarpit-api`: `/health`, `/`, `/tarpit/*path`
+
+The tarpit counts fetches from previously flagged IPs in Redis. `TAR_PIT_MAX_HOPS` defaults to `250` (`0` disables the limit), and `TAR_PIT_HOP_WINDOW_SECONDS` defaults to `86400`. The next hit returns 403 and stores a reason on the existing per-IP blocklist key for `BLOCKLIST_TTL_SECONDS` (default `86400`). Redis failures fail open. Served hits are flagged, forwarded to the configured escalation endpoint, and recorded as `tarpit_hit` audit events with path, client, and reason.
 - `admin-ui`: dashboard, settings, logs, plugins, blocklist endpoints
 - `captcha-service`: `/challenge`, `/solve`, `/verify`
 - `cloud-dashboard`: installation registration and metrics fanout endpoints

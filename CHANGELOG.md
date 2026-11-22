@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-21
+
+### Added
+
+- Flagged tarpit clients now have a Redis per-IP hop limit (`TAR_PIT_MAX_HOPS=250`, `TAR_PIT_HOP_WINDOW_SECONDS=86400`). The next hit returns 403 and stores `Tarpit hop limit exceeded (N hits in Ws)` in the existing blocklist key with `BLOCKLIST_TTL_SECONDS`. Set the maximum to `0` to disable the limit. Redis failures fail open. Served tarpit hits are recorded as `tarpit_hit` audit events with path, client, and reason, flag the IP, and are forwarded to `ESCALATION_ENDPOINT` when configured (#75).
+
 ## [0.1.7] - 2026-11-20
 
 ### Changed
