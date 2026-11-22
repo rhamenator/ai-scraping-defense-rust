@@ -83,8 +83,8 @@ cargo test --workspace
 If Windows reports a missing Rust toolchain manifest, repair or reinstall the pinned toolchain first:
 
 ```powershell
-rustup toolchain uninstall 1.88.0-x86_64-pc-windows-msvc
-rustup toolchain install 1.88.0-x86_64-pc-windows-msvc
+rustup toolchain uninstall 1.100.0-x86_64-pc-windows-msvc
+rustup toolchain install 1.100.0-x86_64-pc-windows-msvc
 ```
 
 ## License
