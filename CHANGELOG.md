@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Several services pointed at one JSONL audit file could lose events. An erasure or retention pass rewrites the whole file, and the in-process lock only orders one service's own tasks, so events another service appended meanwhile were dropped (in a test, more than half of 300). All JSONL appends, erasures and purges now also hold an exclusive file lock on `<audit file>.lock`. PostgreSQL is still the better choice when more than one service writes events.
+
+### Added
+
+- `docs/PRIVACY.md`: what personal data is stored where, how the `GDPR_*` and `AUDIT_*` settings combine, two starting profiles, and the points to settle with your own legal advice (lawful basis, reverse DNS, hashing, retention, jurisdiction). It is not legal advice.
+
 ### Added
 
 - Configurable data-subject erasure (#83 follow-up). `POST /gdpr/deletion-request` now takes `{"ip": "<address>"}` and actually erases: the flag, the block (kept until it expires by default, or removed at once), and the address in stored security events (redacted by default, or the events deleted), as set by `GDPR_ERASURE_MODE` (`redact`, `delete`, `manual`) and `GDPR_ACTIVE_BLOCK_POLICY` (`retain_until_expiry`, `erase_now`). `manual` only records the request. The request record keeps a hash of the address, never the address. `GET /gdpr/compliance-report` reports the policy, real counts and recent requests instead of an empty list. **Behaviour change:** the deletion endpoint used to answer `queued` to any request and do nothing; it now requires `ip` and answers 400 without one. A mistyped `GDPR_*` value stops startup. Addresses are matched as addresses (spelling variants and IPv4-mapped forms), in the event actor as well as the payload; PostgreSQL erasure uses an optimistic update so concurrent requests cannot undo each other. The request record's subject hash is a plain SHA-256 (a pseudonym only) unless `GDPR_HASH_KEY` is set, which makes it a keyed HMAC-SHA256. New opt-in `AUDIT_RETENTION_DAYS` (default `0`, keep everything) deletes older security events daily, keeping erasure records. Verified against a live PostgreSQL 16 in addition to the JSONL store.

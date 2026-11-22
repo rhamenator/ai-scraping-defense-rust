@@ -1358,6 +1358,35 @@ pub struct SecurityEvent {
     pub created_at: DateTime<Utc>,
 }
 
+/// An exclusive advisory lock on `<audit file>.lock`, held until dropped. The in-process `write_lock` only orders the
+/// tasks of one service, but several services (admin, tarpit, escalation, ...) can be pointed at the same JSONL file, and
+/// an erasure or retention pass rewrites the whole file: without a lock shared across processes, an event another service
+/// appends during the rewrite is silently lost.
+struct AuditFileLock(std::fs::File);
+
+impl Drop for AuditFileLock {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.0);
+    }
+}
+
+async fn lock_audit_file(path: &std::path::Path) -> anyhow::Result<AuditFileLock> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs4::FileExt::lock(&file)?;
+        Ok::<_, anyhow::Error>(AuditFileLock(file))
+    })
+    .await?
+}
+
 #[derive(Clone)]
 pub enum AuditStore {
     Postgres(Arc<PgClient>),
@@ -1445,6 +1474,7 @@ impl AuditStore {
             }
             Self::Jsonl { path, write_lock } => {
                 let _guard = write_lock.lock().await;
+                let _file_lock = lock_audit_file(path).await?;
                 let event = SecurityEvent {
                     id: Utc::now().timestamp_micros(),
                     event_type: event_type.to_string(),
@@ -1505,6 +1535,7 @@ impl AuditStore {
             }
             Self::Jsonl { path, write_lock } => {
                 let _guard = write_lock.lock().await;
+                let _file_lock = lock_audit_file(path).await?;
                 let contents = tokio::fs::read_to_string(path.as_ref()).await?;
                 let mut output = String::with_capacity(contents.len());
                 let mut changed = 0;
@@ -1608,6 +1639,7 @@ impl AuditStore {
                 .await?),
             Self::Jsonl { path, write_lock } => {
                 let _guard = write_lock.lock().await;
+                let _file_lock = lock_audit_file(path).await?;
                 let contents = tokio::fs::read_to_string(path.as_ref()).await?;
                 let mut output = String::with_capacity(contents.len());
                 let mut removed = 0;
@@ -1794,6 +1826,63 @@ pub struct IpAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_services_sharing_one_jsonl_file_never_lose_each_others_events() {
+        // Two stores on the same path have separate in-process locks, exactly like two services; only the file lock
+        // orders their appends against the other's whole-file rewrites.
+        let (admin, path) = temp_audit_store().await;
+        let writer = AuditStore::jsonl(&path).await.unwrap();
+        for index in 0..40 {
+            record_security_event(
+                &admin,
+                "seed",
+                "admin",
+                serde_json::json!({"ip": format!("198.51.100.{index}")}),
+            )
+            .await;
+        }
+        let appender = {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                for index in 0..300 {
+                    record_security_event(
+                        &writer,
+                        "appended",
+                        "system",
+                        serde_json::json!({"n": index}),
+                    )
+                    .await;
+                }
+            })
+        };
+
+        for index in 0..40 {
+            admin
+                .erase_subject_events(&format!("198.51.100.{index}"), gdpr::ErasureMode::Redact)
+                .await
+                .unwrap();
+        }
+        appender.await.unwrap();
+
+        let events = load_security_events(&admin, 10_000).await;
+        let appended = events
+            .iter()
+            .filter(|event| event.event_type == "appended")
+            .count();
+        assert_eq!(
+            appended, 300,
+            "events appended by the other service must survive every rewrite"
+        );
+        assert_eq!(events.len(), 340);
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !raw.contains("198.51.100."),
+            "the seeded addresses were erased"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(format!("{}.lock", path.display())).await;
+    }
 
     #[tokio::test]
     async fn retention_purges_old_events_keeps_erasure_records_and_is_off_at_zero() {
