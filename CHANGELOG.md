@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-22
+
+### Security
+
+- Bound AI service webhook and CAPTCHA solve/verify request bodies to 16 KiB before JSON or form decoding; oversized requests return 413.
+
 ## [0.1.8] - 2026-11-21
 
 ### Added

@@ -1,7 +1,7 @@
 use asd_core::{env_string, env_u64, health, observability_router, serve, ServiceConfig};
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
@@ -24,6 +24,7 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_ACTIVE_CHALLENGES: usize = 10_000;
 const MAX_ISSUED_TOKENS: usize = 10_000;
 const MAX_CHALLENGES_PER_SOURCE_PER_MINUTE: u32 = 60;
+const MAX_CAPTCHA_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Deserialize)]
 struct CaptchaSolve {
@@ -160,8 +161,14 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { health("captcha-service").await }))
         .route("/challenge", get(challenge))
-        .route("/solve", post(solve))
-        .route("/verify", post(verify))
+        .route(
+            "/solve",
+            post(solve).layer(DefaultBodyLimit::max(MAX_CAPTCHA_BODY_BYTES)),
+        )
+        .route(
+            "/verify",
+            post(verify).layer(DefaultBodyLimit::max(MAX_CAPTCHA_BODY_BYTES)),
+        )
         .merge(observability_router("captcha-service"))
         .with_state(CaptchaState::from_env()?);
     serve(app, config).await
@@ -220,6 +227,12 @@ fn decode_request<T: DeserializeOwned>(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    if body.len() > MAX_CAPTCHA_BODY_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"status":"error","message":"Payload too large"})),
+        ));
+    }
     let content_type = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
@@ -328,6 +341,29 @@ mod tests {
 
         assert_eq!(response["success"], false);
         assert!(response["token"].is_null());
+    }
+
+    #[test]
+    fn oversized_json_and_form_payloads_are_rejected() {
+        let oversized = "a".repeat(MAX_CAPTCHA_BODY_BYTES);
+        let json_body = format!(r#"{{"answer":"{oversized}"}}"#);
+        let json_result = decode_request::<CaptchaSolve>(&HeaderMap::new(), json_body.as_bytes());
+        assert!(matches!(
+            json_result,
+            Err((StatusCode::PAYLOAD_TOO_LARGE, _))
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        let form_body = format!("answer={oversized}");
+        let form_result = decode_request::<CaptchaSolve>(&headers, form_body.as_bytes());
+        assert!(matches!(
+            form_result,
+            Err((StatusCode::PAYLOAD_TOO_LARGE, _))
+        ));
     }
 
     #[tokio::test]
