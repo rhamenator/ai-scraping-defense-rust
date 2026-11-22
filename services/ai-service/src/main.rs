@@ -3,7 +3,7 @@ use asd_core::{
     verify_hmac_sha256, AuditStore, BlocklistState, ServiceConfig,
 };
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -12,6 +12,8 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+
+const MAX_WEBHOOK_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -39,7 +41,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = Router::new()
         .route("/health", get(|| async { health("ai-service").await }))
-        .route("/webhook", post(webhook))
+        .route(
+            "/webhook",
+            post(webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+        )
         .merge(observability_router("ai-service"))
         .with_state(state);
     serve(app, config).await
@@ -56,6 +61,9 @@ async fn webhook(
             "WEBHOOK_SHARED_SECRET is not configured; run scripts/configure_credentials.py",
         ));
     };
+    if body.len() > MAX_WEBHOOK_BODY_BYTES {
+        return Err(error(StatusCode::PAYLOAD_TOO_LARGE, "Payload too large"));
+    }
     let signature = headers
         .get("x-signature")
         .and_then(|value| value.to_str().ok())
@@ -179,6 +187,18 @@ mod tests {
         let missing_ip_headers = signed_headers(&state, &missing_ip_body);
         let missing_ip = webhook(State(state), missing_ip_headers, missing_ip_body).await;
         assert!(matches!(missing_ip, Err((StatusCode::BAD_REQUEST, _))));
+    }
+
+    #[tokio::test]
+    async fn oversized_signed_webhook_is_rejected_before_deserialization() {
+        let state = state();
+        let body = Bytes::from(format!(
+            r#"{{"action":"flag_ip","ip":"198.51.100.127","reason":"{}"}}"#,
+            "a".repeat(MAX_WEBHOOK_BODY_BYTES)
+        ));
+        let headers = signed_headers(&state, &body);
+        let result = webhook(State(state), headers, body).await;
+        assert!(matches!(result, Err((StatusCode::PAYLOAD_TOO_LARGE, _))));
     }
 
     #[tokio::test]

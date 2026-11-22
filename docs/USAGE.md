@@ -53,6 +53,7 @@ Important settings:
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: optional HTTP(S) OTLP/gRPC collector endpoint. When set, all shared-server HTTP spans are batch-exported with W3C `traceparent` extraction and flushed during process shutdown; malformed endpoints fail startup.
 - `ADMIN_API_KEY`, `ESCALATION_API_KEY`, `PUBLIC_BLOCKLIST_API_KEY`, `JWT_SECRET`: API-key and JWT protection for mutation routes.
 - `WEBHOOK_SHARED_SECRET`: HMAC secret for AI service webhooks.
+- AI service `/webhook` and CAPTCHA `/solve` and `/verify` accept at most 16 KiB per request body and return HTTP 413 for larger bodies.
 - `CAPTCHA_TOKEN_SECRET`, `CAPTCHA_TOKEN_TTL_SECONDS`: shared HMAC key and lifetime for one-time CAPTCHA verification tokens. Configure the same secret on every CAPTCHA replica.
 
 - `CLOUD_MODEL_API_URL`, `CLOUD_MODEL_API_KEY`, `MODEL_PROVIDER`, `MODEL_NAME`: upstream model proxy configuration.
