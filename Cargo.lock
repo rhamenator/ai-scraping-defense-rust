@@ -22,6 +22,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-postgres",
+ "tower",
  "tracing",
  "uuid",
  "webauthn-authenticator-rs",

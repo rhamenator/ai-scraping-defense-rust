@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Scraping Defense Admin</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Arial, sans-serif; }
+    body { margin: 0; background: #f7f8fa; color: #1f2933; }
+    header { background: #1f2933; color: white; padding: 18px 24px; display: flex; justify-content: space-between; align-items: center; }
+    main { max-width: 1040px; margin: 0 auto; padding: 24px; display: grid; gap: 18px; }
+    section { background: white; border: 1px solid #dde3ea; border-radius: 6px; padding: 18px; }
+    h1, h2 { margin: 0 0 12px; }
+    header h1 { margin: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .metric { background: #edf2f7; border-radius: 6px; padding: 12px; text-align: center; }
+    .metric strong { display: block; font-size: 1.8em; }
+    a { color: #0f766e; font-weight: 600; }
+    code { background: #edf2f7; padding: 2px 5px; border-radius: 4px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #dde3ea; vertical-align: top; }
+    #events-table td:last-child { overflow-wrap: anywhere; }
+    label { display: block; margin-top: 8px; }
+    input { padding: 6px; margin: 4px 0 10px; width: 100%; max-width: 420px; box-sizing: border-box; background: #fff; color: #1f2933; border: 1px solid #9aa5b1; border-radius: 4px; }
+    button { padding: 6px 12px; margin-right: 6px; cursor: pointer; background: #edf2f7; color: #1f2933; border: 1px solid #9aa5b1; border-radius: 4px; }
+    dialog { background: #fff; color: #1f2933; }
+    #error { color: #8a1c1c; font-weight: bold; }
+    [hidden] { display: none !important; }
+    dialog { max-width: 420px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AI Scraping Defense Admin</h1>
+    <button type="button" id="sign-out" hidden>Sign out</button>
+  </header>
+  <main>
+    <section id="sign-in-section">
+      <h2>Sign in</h2>
+      <p>Enter the admin API key to start a browser session. The key is sent once and is not kept in this page.</p>
+      <form id="sign-in-form" autocomplete="off">
+        <label for="api-key">Admin API key</label>
+        <input id="api-key" name="api-key" type="password" required autocomplete="off">
+        <button type="submit">Sign in</button>
+      </form>
+    </section>
+
+    <p id="error" role="alert" hidden></p>
+
+    <div id="dashboard" hidden>
+      <section>
+        <h2>Status</h2>
+        <div class="grid">
+          <div class="metric"><strong id="metric-blocked">-</strong>Blocked addresses</div>
+          <div class="metric"><strong id="metric-flagged">-</strong>Flagged addresses</div>
+        </div>
+        <p id="last-updated" role="status">Not loaded yet.</p>
+      </section>
+
+      <section>
+        <h2>Recent security events</h2>
+        <table id="events-table">
+          <thead><tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Actor</th><th scope="col">Details</th></tr></thead>
+          <tbody id="events-body"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Blocklist</h2>
+        <label for="blocklist-search">Search addresses</label>
+        <input id="blocklist-search" type="search" autocomplete="off">
+        <p id="blocklist-status" role="status"></p>
+        <table id="blocklist-table">
+          <thead><tr><th scope="col">Blocked address</th><th scope="col">Action</th></tr></thead>
+          <tbody id="blocklist-body"></tbody>
+        </table>
+        <h2>Block an address</h2>
+        <form id="block-form" autocomplete="off">
+          <label for="block-ip">IP address</label>
+          <input id="block-ip" required maxlength="45">
+          <label for="block-reason">Reason (required)</label>
+          <input id="block-reason" required maxlength="200">
+          <button type="submit">Block address</button>
+        </form>
+      </section>
+    </div>
+
+    <section>
+      <h2>Raw JSON</h2>
+      <div class="grid">
+        <a href="/settings">Settings</a>
+        <a href="/logs">Security events</a>
+        <a href="/metrics">Metrics</a>
+        <a href="/blocklist">Blocklist</a>
+        <a href="/sso/user">SSO user</a>
+        <a href="/mfa/backup-codes/remaining">Backup-code count</a>
+      </div>
+      <p>These links, and API clients, authenticate with <code>x-api-key</code> or a Bearer JWT.</p>
+    </section>
+  </main>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-message"></p>
+      <button value="cancel">Cancel</button>
+      <button value="ok" id="confirm-ok">Confirm</button>
+    </form>
+  </dialog>
+
+  <script>
+    const byId = id => document.getElementById(id);
+    const refreshMs = 15000;
+    let csrfToken = null;
+    let blockedAddresses = [];
+    let refreshTimer = null;
+
+    function showError(message) {
+      const box = byId("error");
+      box.textContent = message || "";
+      box.hidden = !message;
+    }
+
+    function setSignedIn(signedIn) {
+      byId("sign-in-section").hidden = signedIn;
+      byId("dashboard").hidden = !signedIn;
+      byId("sign-out").hidden = !signedIn;
+      if (!signedIn) {
+        csrfToken = null;
+        clearInterval(refreshTimer);
+        refreshTimer = null;
+      }
+    }
+
+    class SignedOut extends Error {}
+
+    async function api(path, options = {}) {
+      const method = options.method || "GET";
+      const headers = {};
+      if (options.body !== undefined) headers["Content-Type"] = "application/json";
+      if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
+      const response = await fetch(path, {
+        method, headers, credentials: "same-origin", cache: "no-store",
+        body: options.body === undefined ? undefined : JSON.stringify(options.body)
+      });
+      let payload = {};
+      try { payload = await response.json(); } catch (e) { /* not JSON */ }
+      if (response.status === 401) throw new SignedOut(payload.error || "Signed out.");
+      if (!response.ok) throw new Error(payload.error || payload.message || `Request failed (${response.status}).`);
+      return payload;
+    }
+
+    function confirmAction(title, message) {
+      const dialog = byId("confirm-dialog");
+      if (typeof dialog.showModal !== "function") return Promise.resolve(window.confirm(title + "\n\n" + message));
+      byId("confirm-title").textContent = title;
+      byId("confirm-message").textContent = message;
+      return new Promise(resolve => {
+        dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
+        dialog.returnValue = "cancel";
+        dialog.showModal();
+      });
+    }
+
+    function summarize(payload) {
+      const text = JSON.stringify(payload);
+      return text.length > 160 ? text.slice(0, 157) + "..." : text;
+    }
+
+    function renderEvents(entries) {
+      const body = byId("events-body");
+      body.textContent = "";
+      for (const entry of entries.slice(0, 25)) {
+        const row = document.createElement("tr");
+        for (const value of [new Date(entry.created_at).toLocaleString(), entry.event_type, entry.actor, summarize(entry.payload)]) {
+          const cell = document.createElement("td");
+          cell.textContent = String(value);
+          row.appendChild(cell);
+        }
+        body.appendChild(row);
+      }
+      if (!entries.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 4;
+        cell.textContent = "No security events recorded.";
+        row.appendChild(cell);
+        body.appendChild(row);
+      }
+    }
+
+    function renderBlocklist() {
+      const body = byId("blocklist-body");
+      body.textContent = "";
+      const query = byId("blocklist-search").value.trim().toLowerCase();
+      const shown = blockedAddresses.filter(ip => !query || ip.toLowerCase().includes(query));
+      for (const ip of shown) {
+        const row = document.createElement("tr");
+        const address = document.createElement("td");
+        address.textContent = ip;
+        const action = document.createElement("td");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "Unblock";
+        button.setAttribute("aria-label", "Unblock " + ip);
+        button.addEventListener("click", () => unblock(ip));
+        action.appendChild(button);
+        row.append(address, action);
+        body.appendChild(row);
+      }
+      byId("blocklist-status").textContent = blockedAddresses.length
+        ? `Showing ${shown.length} of ${blockedAddresses.length} blocked addresses.`
+        : "No addresses are blocked.";
+    }
+
+    async function refresh() {
+      try {
+        const [metrics, logs, list] = await Promise.all([api("/metrics"), api("/logs"), api("/blocklist")]);
+        byId("metric-blocked").textContent = String(metrics.blocked_count);
+        byId("metric-flagged").textContent = String(metrics.flagged_count);
+        renderEvents(logs.entries || []);
+        blockedAddresses = (list.blocked || []).map(String).sort();
+        renderBlocklist();
+        byId("last-updated").textContent = "Last updated: " + new Date().toLocaleString();
+        showError("");
+      } catch (error) {
+        if (error instanceof SignedOut) { setSignedIn(false); showError("Your session ended. Sign in again."); return; }
+        byId("last-updated").textContent = "Last update failed; showing the previous data.";
+        showError("Could not refresh: " + error.message);
+      }
+    }
+
+    function startSession(payload) {
+      csrfToken = payload.csrf_token;
+      setSignedIn(true);
+      showError("");
+      refresh();
+      clearInterval(refreshTimer);
+      refreshTimer = setInterval(refresh, refreshMs);
+    }
+
+    async function unblock(ip) {
+      showError("");
+      if (!await confirmAction("Unblock this address?", ip + " will be able to reach the protected site again.")) return;
+      try {
+        await api("/unblock", { method: "POST", body: { ip } });
+        await refresh();
+      } catch (error) {
+        if (error instanceof SignedOut) { setSignedIn(false); showError("Your session ended. Sign in again."); return; }
+        showError(error.message);
+      }
+    }
+
+    byId("blocklist-search").addEventListener("input", renderBlocklist);
+
+    byId("block-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      showError("");
+      const ip = byId("block-ip").value.trim();
+      const reason = byId("block-reason").value.trim();
+      if (!ip || !reason) { showError("Enter both an IP address and a reason."); return; }
+      if (!await confirmAction("Block this address?", ip + " will be refused by the protected site. Reason: " + reason)) return;
+      try {
+        await api("/block", { method: "POST", body: { ip, reason } });
+        byId("block-form").reset();
+        await refresh();
+      } catch (error) {
+        if (error instanceof SignedOut) { setSignedIn(false); showError("Your session ended. Sign in again."); return; }
+        showError(error.message);
+      }
+    });
+
+    byId("sign-in-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      showError("");
+      const field = byId("api-key");
+      const apiKey = field.value;
+      field.value = "";
+      try {
+        startSession(await api("/session", { method: "POST", body: { api_key: apiKey } }));
+      } catch (error) {
+        showError(error instanceof SignedOut ? "The API key was rejected." : error.message);
+      }
+    });
+
+    byId("sign-out").addEventListener("click", async () => {
+      showError("");
+      try {
+        await api("/logout", { method: "POST" });
+        setSignedIn(false);
+      } catch (error) {
+        // Only report signed out once the server has ended the session; a failed request leaves it active.
+        if (error instanceof SignedOut) { setSignedIn(false); return; }
+        showError("Sign-out failed, so you are still signed in: " + error.message + " Try again.");
+      }
+    });
+
+    (async () => {
+      try {
+        const session = await api("/session");
+        if (session.authenticated) startSession(session);
+      } catch (error) { /* stay on the sign-in form */ }
+    })();
+  </script>
+</body>
+</html>
