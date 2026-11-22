@@ -154,7 +154,7 @@ async fn require_admin_middleware(
     let mut via_session = false;
     if !public_path {
         let configured_auth = is_authorized(request.headers(), "ADMIN_API_KEY", "JWT_SECRET");
-        let browser_session = if configured_auth {
+        let browser_session = if configured_auth || !session_may_access(request.method(), &path) {
             None
         } else {
             browser_session_for(&state, request.headers()).await
@@ -907,15 +907,37 @@ fn session_ttl() -> Duration {
     Duration::from_secs(seconds.clamp(60, 86_400))
 }
 
-/// Compares two strings without stopping at the first difference.
+/// Compares two strings without stopping at the first difference. Every byte of the longer string is visited,
+/// and a length mismatch alone makes the result false.
 fn constant_time_eq(left: &str, right: &str) -> bool {
-    use sha2::Digest;
-    let left = sha2::Sha256::digest(left.as_bytes());
-    let right = sha2::Sha256::digest(right.as_bytes());
-    left.iter()
-        .zip(right.iter())
-        .fold(0_u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(a ^ b);
+    }
+    difference == 0
+}
+
+/// A browser session is accepted only for what the console needs. Everything else, including passkey enrolment,
+/// MFA setup and plugin changes, requires the API key or a JWT in a header, so a stolen or abused cookie cannot
+/// create credentials that outlive it.
+fn session_may_access(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::GET | Method::HEAD => matches!(
+            path,
+            "/settings"
+                | "/logs"
+                | "/metrics"
+                | "/block_stats"
+                | "/blocklist"
+                | "/plugins"
+                | "/mfa/backup-codes/remaining"
+        ),
+        Method::POST => matches!(path, "/block" | "/unblock" | "/logout"),
+        _ => false,
+    }
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -1144,6 +1166,15 @@ mod browser_session_tests {
             .route("/block", post(block))
             .route("/unblock", post(unblock))
             .route("/mfa/backup-codes", post(mfa_backup_codes))
+            .route("/mfa/totp/setup", post(mfa_totp_setup))
+            .route("/plugins", get(plugins).post(update_plugins))
+            .route("/gdpr/deletion-request", post(gdpr_deletion))
+            .route("/passkey/register", post(webauthn_register_begin))
+            .route("/webauthn/register/begin", post(webauthn_register_begin))
+            .route(
+                "/webauthn/register/complete",
+                post(webauthn_register_complete),
+            )
             .route("/logout", post(logout))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -1334,18 +1365,72 @@ mod browser_session_tests {
     }
 
     #[tokio::test]
-    async fn a_browser_session_cannot_reach_the_mfa_secrets_endpoints() {
+    async fn a_browser_session_is_refused_everywhere_except_the_console_routes() {
         let app = app(test_state().await);
         let (cookie, csrf) = sign_in(&app).await;
+        let session = [("cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
+        // Passkey enrolment would create a credential that outlives the session; MFA setup, backup codes, plugin
+        // changes and GDPR requests are not part of the console either. Even with a valid session and token: 401.
+        for path in [
+            "/mfa/backup-codes",
+            "/mfa/totp/setup",
+            "/plugins",
+            "/gdpr/deletion-request",
+            "/passkey/register",
+            "/webauthn/register/begin",
+            "/webauthn/register/complete",
+        ] {
+            let (status, _, _) = call(&app, "POST", path, &session, Some(json!({}))).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "POST {path}");
+        }
+        // The same endpoints still work for header credentials.
         let (status, _, _) = call(
             &app,
             "POST",
-            "/mfa/backup-codes",
-            &[("cookie", &cookie), ("x-csrf-token", &csrf)],
+            "/mfa/totp/setup",
+            &[("x-api-key", KEY)],
             Some(json!({})),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        // And the console routes are open to the session.
+        for path in ["/blocklist", "/plugins"] {
+            let (status, _, _) =
+                call(&app, "GET", path, &[("cookie", cookie.as_str())], None).await;
+            assert_eq!(status, StatusCode::OK, "GET {path}");
+        }
+    }
+
+    #[test]
+    fn the_session_allowlist_is_exactly_the_console_routes() {
+        for path in [
+            "/settings",
+            "/logs",
+            "/metrics",
+            "/block_stats",
+            "/blocklist",
+            "/plugins",
+            "/mfa/backup-codes/remaining",
+        ] {
+            assert!(session_may_access(&Method::GET, path), "GET {path}");
+            assert!(!session_may_access(&Method::POST, path), "POST {path}");
+        }
+        for path in ["/block", "/unblock", "/logout"] {
+            assert!(session_may_access(&Method::POST, path), "POST {path}");
+            assert!(!session_may_access(&Method::GET, path), "GET {path}");
+        }
+        for (method, path) in [
+            (Method::POST, "/plugins"),
+            (Method::POST, "/passkey/register"),
+            (Method::POST, "/webauthn/register/complete"),
+            (Method::POST, "/mfa/totp/setup"),
+            (Method::POST, "/gdpr/deletion-request"),
+            (Method::GET, "/gdpr/compliance-report"),
+            (Method::DELETE, "/block"),
+            (Method::PUT, "/block"),
+        ] {
+            assert!(!session_may_access(&method, path), "{method} {path}");
+        }
     }
 
     #[tokio::test]
@@ -1470,6 +1555,7 @@ mod browser_session_tests {
         assert!(page.contains("textContent"));
         assert!(page.contains("\"X-CSRF-Token\""));
         assert!(page.contains("Last update failed"));
+        assert!(page.contains("Sign-out failed, so you are still signed in"));
         for forbidden in [
             "innerHTML",
             "outerHTML",

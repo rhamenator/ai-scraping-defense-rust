@@ -284,8 +284,15 @@
     });
 
     byId("sign-out").addEventListener("click", async () => {
-      try { await api("/logout", { method: "POST" }); } catch (error) { /* the session is dropped either way */ }
-      setSignedIn(false);
+      showError("");
+      try {
+        await api("/logout", { method: "POST" });
+        setSignedIn(false);
+      } catch (error) {
+        // Only report signed out once the server has ended the session; a failed request leaves it active.
+        if (error instanceof SignedOut) { setSignedIn(false); return; }
+        showError("Sign-out failed, so you are still signed in: " + error.message + " Try again.");
+      }
     });
 
     (async () => {
