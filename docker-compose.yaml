@@ -92,6 +92,7 @@ services:
         condition: service_healthy
     command: ["/usr/local/bin/tarpit-api"]
     environment:
+      <<: *cloudflare-env
       TARPIT_API_PORT: "8003"
       RUST_LOG: info
       POSTGRES_ENABLED: "true"
