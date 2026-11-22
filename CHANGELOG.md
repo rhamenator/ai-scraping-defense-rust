@@ -6,6 +6,10 @@
 
 - Update `url` to 2.5.9 (and `form_urlencoded` to 1.2.3) to fix RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on deeply nested `blob:` URLs. Lockfile-only change.
 
+### Changed
+
+- The admin service no longer claims work it does not do (#83). `POST /operations/blocklist-sync`, `/operations/rules-fetch` and `/operations/robots-fetch` and `POST /plugins` now return `501 Not Implemented` with `{"status":"not_implemented",...}` instead of `queued` or `success`, because nothing in the Rust edition executes them. The attempt is still audited, as `admin_operation_unsupported` or `admin_update_plugins_unsupported` (previously `admin_operation_queued` and `admin_update_plugins`). `GET /plugins` now also reports `"editable": false`.
+
 ## [0.1.9] - 2026-11-22
 
 ### Security
