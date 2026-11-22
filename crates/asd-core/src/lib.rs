@@ -1467,7 +1467,8 @@ impl AuditStore {
         Ok(())
     }
 
-    /// Redacts or removes every stored event that mentions `ip` as a whole address, and returns how many events changed.
+    /// Redacts or removes every stored event that mentions `ip` (compared as an address, in the actor or the payload),
+    /// and returns how many events changed.
     pub async fn erase_subject_events(
         &self,
         ip: &str,
@@ -1478,34 +1479,27 @@ impl AuditStore {
         }
         match self {
             Self::Postgres(pg) => {
-                let rows = pg
-                    .query(
-                        "SELECT id, payload FROM security_events WHERE position($1 in payload::text) > 0",
+                // A cheap prefilter. IPv4 has one spelling, so its text can be searched for; IPv6 has many, so any
+                // value containing a colon is a candidate and the exact comparison is done on the address.
+                let candidates = if ip.contains(':') {
+                    pg.query(
+                        "SELECT id FROM security_events WHERE position(':' in payload::text) > 0 OR position(':' in actor) > 0",
+                        &[],
+                    )
+                    .await?
+                } else {
+                    pg.query(
+                        "SELECT id FROM security_events WHERE position($1 in payload::text) > 0 OR position($1 in actor) > 0",
                         &[&ip],
                     )
-                    .await?;
+                    .await?
+                };
                 let mut changed = 0;
-                for row in rows {
-                    let id: i64 = row.get(0);
-                    let mut payload: serde_json::Value = row.get(1);
-                    if !gdpr::mentions_subject(&payload, ip) {
-                        continue;
+                for candidate in candidates {
+                    let id: i64 = candidate.get(0);
+                    if erase_one_postgres_event(pg, id, ip, mode).await? {
+                        changed += 1;
                     }
-                    match mode {
-                        gdpr::ErasureMode::Delete => {
-                            pg.execute("DELETE FROM security_events WHERE id = $1", &[&id])
-                                .await?;
-                        }
-                        _ => {
-                            gdpr::redact_subject(&mut payload, ip);
-                            pg.execute(
-                                "UPDATE security_events SET payload = $1 WHERE id = $2",
-                                &[&payload, &id],
-                            )
-                            .await?;
-                        }
-                    }
-                    changed += 1;
                 }
                 Ok(changed)
             }
@@ -1516,11 +1510,12 @@ impl AuditStore {
                 let mut changed = 0;
                 for line in contents.lines() {
                     match serde_json::from_str::<SecurityEvent>(line) {
-                        Ok(mut event) if gdpr::mentions_subject(&event.payload, ip) => {
+                        Ok(mut event) if gdpr::event_mentions(&event.actor, &event.payload, ip) => {
                             changed += 1;
                             if mode == gdpr::ErasureMode::Delete {
                                 continue;
                             }
+                            event.actor = gdpr::replace_address(&event.actor, ip, "[erased]").0;
                             gdpr::redact_subject(&mut event.payload, ip);
                             output.push_str(&serde_json::to_string(&event)?);
                             output.push('\n');
@@ -1538,6 +1533,103 @@ impl AuditStore {
                     tokio::fs::rename(&temporary, path.as_ref()).await?;
                 }
                 Ok(changed)
+            }
+            Self::Disabled => Ok(0),
+        }
+    }
+
+    /// The newest events of the given types (filtered before the limit is applied) and how many such events exist.
+    pub async fn events_of_types(
+        &self,
+        event_types: &[&str],
+        limit: i64,
+    ) -> anyhow::Result<(Vec<SecurityEvent>, u64)> {
+        let limit = limit.clamp(1, 10_000);
+        match self {
+            Self::Postgres(pg) => {
+                let types: Vec<String> = event_types
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect();
+                let rows = pg
+                    .query(
+                        "SELECT id, event_type, actor, payload, created_at FROM security_events
+                         WHERE event_type = ANY($1) ORDER BY created_at DESC LIMIT $2",
+                        &[&types, &limit],
+                    )
+                    .await?;
+                let total: i64 = pg
+                    .query_one(
+                        "SELECT count(*) FROM security_events WHERE event_type = ANY($1)",
+                        &[&types],
+                    )
+                    .await?
+                    .get(0);
+                let events = rows
+                    .into_iter()
+                    .map(|row| SecurityEvent {
+                        id: row.get(0),
+                        event_type: row.get(1),
+                        actor: row.get(2),
+                        payload: row.get(3),
+                        created_at: row.get(4),
+                    })
+                    .collect();
+                Ok((events, total as u64))
+            }
+            Self::Jsonl { .. } => {
+                let mut matching: Vec<SecurityEvent> = self
+                    .load(10_000)
+                    .await?
+                    .into_iter()
+                    .filter(|event| event_types.contains(&event.event_type.as_str()))
+                    .collect();
+                let total = matching.len() as u64;
+                matching.truncate(limit as usize);
+                Ok((matching, total))
+            }
+            Self::Disabled => Ok((Vec::new(), 0)),
+        }
+    }
+
+    /// Deletes security events older than `days` days and returns how many were removed. The records of erasure requests
+    /// are kept: they are the evidence that a request was honoured. `days == 0` removes nothing.
+    pub async fn purge_older_than(&self, days: u64) -> anyhow::Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        let cutoff = Utc::now() - chrono::Duration::days(days.min(36_500) as i64);
+        match self {
+            Self::Postgres(pg) => Ok(pg
+                .execute(
+                    "DELETE FROM security_events WHERE created_at < $1 AND event_type NOT LIKE 'gdpr\\_erasure\\_%'",
+                    &[&cutoff],
+                )
+                .await?),
+            Self::Jsonl { path, write_lock } => {
+                let _guard = write_lock.lock().await;
+                let contents = tokio::fs::read_to_string(path.as_ref()).await?;
+                let mut output = String::with_capacity(contents.len());
+                let mut removed = 0;
+                for line in contents.lines() {
+                    match serde_json::from_str::<SecurityEvent>(line) {
+                        Ok(event)
+                            if event.created_at < cutoff && !event.event_type.starts_with("gdpr_erasure_") =>
+                        {
+                            removed += 1;
+                        }
+                        _ => {
+                            output.push_str(line);
+                            output.push('\n');
+                        }
+                    }
+                }
+                if removed > 0 {
+                    let temporary = path.with_extension("jsonl.purging");
+                    tokio::fs::write(&temporary, output).await?;
+                    tokio::fs::rename(&temporary, path.as_ref()).await?;
+                }
+                Ok(removed)
             }
             Self::Disabled => Ok(0),
         }
@@ -1613,6 +1705,50 @@ impl AuditStore {
     }
 }
 
+/// Erases one event with an optimistic update: the new value is written only if the row still holds what was read, and
+/// the read is repeated otherwise, so two requests erasing different addresses from the same event cannot undo each
+/// other. Returns whether the event was changed.
+async fn erase_one_postgres_event(
+    pg: &PgClient,
+    id: i64,
+    ip: &str,
+    mode: gdpr::ErasureMode,
+) -> anyhow::Result<bool> {
+    for _ in 0..8 {
+        let Some(row) = pg
+            .query_opt(
+                "SELECT actor, payload FROM security_events WHERE id = $1",
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(false); // removed meanwhile
+        };
+        let actor: String = row.get(0);
+        let payload: serde_json::Value = row.get(1);
+        if !gdpr::event_mentions(&actor, &payload, ip) {
+            return Ok(false);
+        }
+        let affected = if mode == gdpr::ErasureMode::Delete {
+            pg.execute("DELETE FROM security_events WHERE id = $1", &[&id])
+                .await?
+        } else {
+            let new_actor = gdpr::replace_address(&actor, ip, "[erased]").0;
+            let mut new_payload = payload.clone();
+            gdpr::redact_subject(&mut new_payload, ip);
+            pg.execute(
+                "UPDATE security_events SET actor = $1, payload = $2 WHERE id = $3 AND actor = $4 AND payload = $5",
+                &[&new_actor, &new_payload, &id, &actor, &payload],
+            )
+            .await?
+        };
+        if affected > 0 {
+            return Ok(true);
+        }
+    }
+    anyhow::bail!("event {id} kept changing while it was being erased")
+}
+
 pub async fn ensure_security_event_table(pg: &PgClient) -> Result<(), tokio_postgres::Error> {
     pg.execute(
         "CREATE TABLE IF NOT EXISTS security_events (
@@ -1658,6 +1794,408 @@ pub struct IpAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retention_purges_old_events_keeps_erasure_records_and_is_off_at_zero() {
+        let (store, path) = temp_audit_store().await;
+        let old = (Utc::now() - chrono::Duration::days(120)).to_rfc3339();
+        let recent = Utc::now().to_rfc3339();
+        let line = |event_type: &str, at: &str| {
+            format!(
+                "{{\"id\":{},\"event_type\":\"{event_type}\",\"actor\":\"x\",\"payload\":{{}},\"created_at\":\"{at}\"}}\n",
+                at.len() as i64 + event_type.len() as i64
+            )
+        };
+        let contents = [
+            line("tarpit_hit", &old),
+            line("gdpr_erasure_completed", &old),
+            line("tarpit_hit", &recent),
+        ]
+        .concat();
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        assert_eq!(
+            store.purge_older_than(0).await.unwrap(),
+            0,
+            "zero days means keep everything"
+        );
+        assert_eq!(store.count_events().await.unwrap(), 3);
+        assert_eq!(store.purge_older_than(90).await.unwrap(), 1);
+
+        let left = load_security_events(&store, 10).await;
+        assert_eq!(left.len(), 2);
+        assert!(
+            left.iter()
+                .any(|event| event.event_type == "gdpr_erasure_completed"),
+            "erasure records outlive retention"
+        );
+        assert_eq!(store.purge_older_than(90).await.unwrap(), 0, "idempotent");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ASD_TEST_POSTGRES_URL"]
+    async fn postgres_retention_purges_old_events_but_not_erasure_records() {
+        let pg = live_postgres().await;
+        pg.execute(
+            "INSERT INTO security_events (event_type, actor, payload, created_at) VALUES
+               ('tarpit_hit', 'a', '{}', NOW() - INTERVAL '120 days'),
+               ('gdpr_erasure_completed', 'a', '{}', NOW() - INTERVAL '120 days'),
+               ('gdpr_erasure_recorded', 'a', '{}', NOW() - INTERVAL '120 days'),
+               ('gdprXerasureXother', 'a', '{}', NOW() - INTERVAL '120 days'),
+               ('tarpit_hit', 'a', '{}', NOW())",
+            &[],
+        )
+        .await
+        .unwrap();
+        let store = AuditStore::Postgres(pg);
+
+        assert_eq!(store.purge_older_than(0).await.unwrap(), 0);
+        assert_eq!(
+            store.purge_older_than(90).await.unwrap(),
+            2,
+            "the old tarpit_hit and the look-alike type"
+        );
+        assert_eq!(store.count_events().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn jsonl_erasure_also_covers_the_actor_and_other_spellings_of_the_address() {
+        let (store, path) = temp_audit_store().await;
+        record_security_event(
+            &store,
+            "tarpit_hit",
+            "2001:0DB8:0:0:0:0:0:1",
+            serde_json::json!({"path": "/x"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "admin_block_ip",
+            "admin",
+            serde_json::json!({"ip": "2001:db8:0:0:0:0:0:1"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "tarpit_hit",
+            "198.51.100.1",
+            serde_json::json!({"path": "/y"}),
+        )
+        .await;
+
+        let changed = store
+            .erase_subject_events("2001:db8::1", gdpr::ErasureMode::Redact)
+            .await
+            .unwrap();
+
+        assert_eq!(changed, 2);
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!raw.to_lowercase().contains("2001:0db8") && !raw.contains("2001:db8"));
+        assert!(raw.contains("198.51.100.1"));
+        let events = load_security_events(&store, 10).await;
+        assert!(events.iter().any(|event| event.event_type == "tarpit_hit"
+            && event.actor == "[erased]"
+            && event.payload["path"] == "/x"));
+        assert_eq!(
+            store
+                .erase_subject_events("2001:db8::1", gdpr::ErasureMode::Delete)
+                .await
+                .unwrap(),
+            0
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn jsonl_delete_mode_removes_events_found_only_through_the_actor() {
+        let (store, path) = temp_audit_store().await;
+        record_security_event(
+            &store,
+            "escalation_decision",
+            "203.0.113.7",
+            serde_json::json!({"verdict": "block"}),
+        )
+        .await;
+        record_security_event(
+            &store,
+            "escalation_decision",
+            "203.0.113.8",
+            serde_json::json!({"verdict": "allow"}),
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Delete)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let remaining = load_security_events(&store, 10).await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].actor, "203.0.113.8");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_report_query_filters_by_type_before_it_limits() {
+        let (store, path) = temp_audit_store().await;
+        record_security_event(
+            &store,
+            "gdpr_erasure_completed",
+            "admin",
+            serde_json::json!({"request_id": "old"}),
+        )
+        .await;
+        for index in 0..30 {
+            record_security_event(
+                &store,
+                "tarpit_hit",
+                "system",
+                serde_json::json!({"n": index}),
+            )
+            .await;
+        }
+        record_security_event(
+            &store,
+            "gdpr_erasure_recorded",
+            "admin",
+            serde_json::json!({"request_id": "new"}),
+        )
+        .await;
+
+        let (found, total) = store
+            .events_of_types(&["gdpr_erasure_completed", "gdpr_erasure_recorded"], 1)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(found.len(), 1, "the limit applies after filtering");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    // ---- live PostgreSQL ----------------------------------------------------------------------------------
+    // Run with: ASD_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:15432/db cargo test -p asd-core -- --ignored
+
+    async fn live_postgres() -> Arc<PgClient> {
+        let url = std::env::var("ASD_TEST_POSTGRES_URL")
+            .expect("set ASD_TEST_POSTGRES_URL to run the live PostgreSQL tests");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        ensure_security_event_table(&client).await.unwrap();
+        client
+            .execute("TRUNCATE security_events", &[])
+            .await
+            .unwrap();
+        Arc::new(client)
+    }
+
+    async fn pg_event(pg: &PgClient, event_type: &str, actor: &str, payload: serde_json::Value) {
+        pg.execute(
+            "INSERT INTO security_events (event_type, actor, payload) VALUES ($1, $2, $3)",
+            &[&event_type, &actor, &payload],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ASD_TEST_POSTGRES_URL"]
+    async fn postgres_redaction_covers_actor_payload_and_spellings_and_keeps_the_events() {
+        let pg = live_postgres().await;
+        pg_event(
+            &pg,
+            "tarpit_hit",
+            "2001:0DB8:0:0:0:0:0:1",
+            serde_json::json!({"path": "/x"}),
+        )
+        .await;
+        pg_event(
+            &pg,
+            "admin_block_ip",
+            "admin",
+            serde_json::json!({"ip": "2001:db8:0:0:0:0:0:1", "reason": "scraper"}),
+        )
+        .await;
+        pg_event(
+            &pg,
+            "tarpit_hit",
+            "198.51.100.1",
+            serde_json::json!({"ip": "198.51.100.1"}),
+        )
+        .await;
+        pg_event(
+            &pg,
+            "tarpit_hit",
+            "system",
+            serde_json::json!({"client": "2001:db8::10"}),
+        )
+        .await;
+        let store = AuditStore::Postgres(pg.clone());
+
+        let changed = store
+            .erase_subject_events("2001:db8::1", gdpr::ErasureMode::Redact)
+            .await
+            .unwrap();
+
+        assert_eq!(changed, 2);
+        assert_eq!(
+            store.count_events().await.unwrap(),
+            4,
+            "redaction keeps every event"
+        );
+        let rows = pg
+            .query(
+                "SELECT actor, payload::text FROM security_events ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        let dump: String = rows
+            .iter()
+            .map(|row| format!("{} {}", row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !dump.to_lowercase().contains("2001:0db8") && !dump.contains("2001:db8:0:0"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("[erased]") && dump.contains("scraper") && dump.contains("198.51.100.1")
+        );
+        assert!(
+            dump.contains("2001:db8::10"),
+            "a different address must be left alone"
+        );
+        assert_eq!(
+            store
+                .erase_subject_events("2001:db8::1", gdpr::ErasureMode::Redact)
+                .await
+                .unwrap(),
+            0,
+            "idempotent"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ASD_TEST_POSTGRES_URL"]
+    async fn postgres_delete_mode_removes_events_found_through_actor_or_payload() {
+        let pg = live_postgres().await;
+        pg_event(
+            &pg,
+            "escalation_decision",
+            "203.0.113.7",
+            serde_json::json!({"verdict": "block"}),
+        )
+        .await;
+        pg_event(
+            &pg,
+            "admin_block_ip",
+            "admin",
+            serde_json::json!({"ip": "203.0.113.7"}),
+        )
+        .await;
+        pg_event(
+            &pg,
+            "admin_block_ip",
+            "admin",
+            serde_json::json!({"ip": "203.0.113.70"}),
+        )
+        .await;
+        let store = AuditStore::Postgres(pg);
+
+        assert_eq!(
+            store
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Delete)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.count_events().await.unwrap(), 1);
+        assert_eq!(
+            store
+                .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Manual)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ASD_TEST_POSTGRES_URL"]
+    async fn postgres_concurrent_erasures_of_two_addresses_in_one_event_do_not_undo_each_other() {
+        let pg = live_postgres().await;
+        let store = AuditStore::Postgres(pg.clone());
+        for round in 0..40 {
+            pg.execute("TRUNCATE security_events", &[]).await.unwrap();
+            pg_event(
+                &pg,
+                "peer_sync",
+                "system",
+                serde_json::json!({"a": "203.0.113.7", "b": "203.0.113.8", "round": round}),
+            )
+            .await;
+            let (first, second) = (store.clone(), store.clone());
+            let one = tokio::spawn(async move {
+                first
+                    .erase_subject_events("203.0.113.7", gdpr::ErasureMode::Redact)
+                    .await
+            });
+            let two = tokio::spawn(async move {
+                second
+                    .erase_subject_events("203.0.113.8", gdpr::ErasureMode::Redact)
+                    .await
+            });
+            assert_eq!(one.await.unwrap().unwrap(), 1);
+            assert_eq!(two.await.unwrap().unwrap(), 1);
+            let text: String = pg
+                .query_one("SELECT payload::text FROM security_events", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert!(
+                !text.contains("203.0.113.7") && !text.contains("203.0.113.8"),
+                "round {round}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ASD_TEST_POSTGRES_URL"]
+    async fn postgres_report_query_counts_old_requests_behind_thousands_of_newer_events() {
+        let pg = live_postgres().await;
+        pg.execute(
+            "INSERT INTO security_events (event_type, actor, payload, created_at)
+             VALUES ('gdpr_erasure_completed', 'admin', '{\"request_id\": \"old\"}', NOW() - INTERVAL '400 days'),
+                    ('gdpr_erasure_recorded', 'admin', '{\"request_id\": \"older\"}', NOW() - INTERVAL '500 days')",
+            &[],
+        )
+        .await
+        .unwrap();
+        pg.execute(
+            "INSERT INTO security_events (event_type, actor, payload)
+             SELECT 'tarpit_hit', 'system', '{}'::jsonb FROM generate_series(1, 10500)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let store = AuditStore::Postgres(pg);
+
+        let (found, total) = store
+            .events_of_types(&["gdpr_erasure_completed", "gdpr_erasure_recorded"], 20)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].payload["request_id"], "old", "newest first");
+    }
 
     async fn temp_audit_store() -> (AuditStore, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("asd-gdpr-{}.jsonl", uuid::Uuid::new_v4()));

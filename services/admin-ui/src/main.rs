@@ -39,6 +39,8 @@ struct AppState {
     mfa_attempts: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
     sessions: SessionStore,
     gdpr: asd_core::gdpr::GdprConfig,
+    /// Optional secret for the subject hash (`GDPR_HASH_KEY`); see `asd_core::gdpr::subject_hash`.
+    gdpr_hash_key: Option<Arc<Vec<u8>>>,
 }
 
 const SESSION_COOKIE: &str = "asd_admin_session";
@@ -78,8 +80,14 @@ async fn main() -> anyhow::Result<()> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         // A mistyped setting stops startup instead of silently changing what a deletion request does.
         gdpr: asd_core::gdpr::GdprConfig::from_env()?,
+        gdpr_hash_key: asd_core::gdpr::hash_key_from_env().map(Arc::new),
     };
     ensure_admin_auth_tables(state.pg.as_deref()).await?;
+    // Retention is a deployment policy decision, so it is off unless AUDIT_RETENTION_DAYS is set above zero.
+    let retention_days = asd_core::env_u64("AUDIT_RETENTION_DAYS", 0);
+    if retention_days > 0 {
+        spawn_audit_retention(state.audit.clone(), retention_days);
+    }
     let app = Router::new()
         .route("/health", get(|| async { health("admin-ui").await }))
         .route("/", get(index))
@@ -121,6 +129,21 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with_state(state);
     serve(app, config).await
+}
+
+/// Purges security events older than the configured retention at start-up and then once a day. Erasure request
+/// records are kept. A failure is logged and retried at the next tick, never fatal.
+fn spawn_audit_retention(audit: AuditStore, days: u64) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            match audit.purge_older_than(days).await {
+                Ok(removed) => tracing::info!(removed, days, "audit retention pass finished"),
+                Err(exc) => tracing::error!(error = %exc, "audit retention pass failed"),
+            }
+        }
+    });
 }
 
 async fn require_admin_middleware(
@@ -356,7 +379,8 @@ async fn gdpr_deletion(
     };
     let config = state.gdpr;
     let request_id = uuid::Uuid::new_v4().to_string();
-    let subject_hash = asd_core::gdpr::subject_hash(&ip);
+    let subject_hash =
+        asd_core::gdpr::subject_hash(&ip, state.gdpr_hash_key.as_deref().map(Vec::as_slice));
 
     if config.mode == ErasureMode::Manual {
         record_security_event(
@@ -428,19 +452,20 @@ async fn gdpr_deletion(
 /// What the service holds and has done about erasure requests: real counts, not a placeholder.
 async fn gdpr_report(State(state): State<AppState>) -> Json<serde_json::Value> {
     let stats = state.blocklist.stats().await;
-    let events = load_security_events(&state.audit, 10_000).await;
-    let requests: Vec<_> = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.event_type.as_str(),
-                "gdpr_erasure_completed" | "gdpr_erasure_recorded"
-            )
-        })
-        .collect();
+    // Filtered by type before the limit, so old requests never fall out of the count behind newer events.
+    let (requests, total_requests) = match state
+        .audit
+        .events_of_types(&["gdpr_erasure_completed", "gdpr_erasure_recorded"], 20)
+        .await
+    {
+        Ok(found) => found,
+        Err(exc) => {
+            tracing::error!(error = %exc, "failed to read erasure request records");
+            (Vec::new(), 0)
+        }
+    };
     let recent: Vec<_> = requests
         .iter()
-        .take(20)
         .map(|event| {
             json!({
                 "request_id": event.payload["request_id"],
@@ -466,7 +491,7 @@ async fn gdpr_report(State(state): State<AppState>) -> Json<serde_json::Value> {
             "audit_backend": state.audit.backend_name()
         },
         "erasure_requests": {
-            "total": requests.len(),
+            "total": total_requests,
             "recent": recent
         }
     }))
@@ -1284,6 +1309,7 @@ mod browser_session_tests {
             pg: None,
             audit,
             gdpr,
+            gdpr_hash_key: None,
             oidc: oidc::OidcVerifier::from_env().unwrap(),
             passkeys: Arc::new(webauthn::PasskeyService::from_env().unwrap()),
             mfa_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -1814,7 +1840,10 @@ mod gdpr_erasure_tests {
         );
         assert!(raw.contains("[erased]") && raw.contains("198.51.100.1"));
         assert!(!body.to_string().contains(SUBJECT));
-        assert_eq!(body["subject_hash"], asd_core::gdpr::subject_hash(SUBJECT));
+        assert_eq!(
+            body["subject_hash"],
+            asd_core::gdpr::subject_hash(SUBJECT, None)
+        );
         let _ = tokio::fs::remove_file(&path).await;
     }
 
