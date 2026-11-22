@@ -10,6 +10,20 @@ The people who run a deployment (the operators) decide why and how visitors' dat
 law they are the controllers. The project provides the software and the settings below. Which settings fit depends on
 where you operate, who your visitors are, and your own legal advice, which is why none of this is hard-coded.
 
+## Role and scope of the project
+
+- The project publishes this software under the GNU General Public License v3. It does not operate any deployment, and
+  it does not host, receive or process data from deployments.
+- The software does not send telemetry, usage statistics or any other data to the project or its author. The only
+  outbound connections are ones an operator configures, such as an alert webhook, a community blocklist feed, a peer, an
+  OpenTelemetry collector or a model endpoint. If you find code that reports to the project, treat it as a bug and report it.
+- Operators decide what to collect, for how long and under which law, and are responsible for their own compliance:
+  privacy notices, lawful basis, and requests from the people whose data they hold. The settings on this page are
+  offered to make that easier. Their defaults are a starting point, not a finding that any deployment complies with any
+  law.
+- The software cannot stop an operator from changing these settings or the code, and the licence permits modification.
+- Sections 15 and 16 of the licence disclaim warranty and liability to the extent the law allows.
+
 ## What is stored, and where
 
 The only personal data this edition holds about a visitor is the IP address they connected from.
