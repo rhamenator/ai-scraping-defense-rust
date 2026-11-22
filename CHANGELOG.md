@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- Update `url` to 2.5.9 (and `form_urlencoded` to 1.2.3) to fix RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on deeply nested `blob:` URLs. Lockfile-only change.
+
 ## [0.1.9] - 2026-11-22
 
 ### Security
