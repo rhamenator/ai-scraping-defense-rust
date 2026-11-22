@@ -365,15 +365,25 @@ mod tests {
 
     #[test]
     fn a_keyed_hash_differs_from_the_plain_one_and_depends_on_the_key() {
+        // keys generated for the test, never literals
+        let first_key = uuid::Uuid::new_v4().to_string().into_bytes();
+        let second_key = uuid::Uuid::new_v4().to_string().into_bytes();
         let plain = subject_hash("203.0.113.7", None);
-        let first = subject_hash("203.0.113.7", Some(b"first key"));
-        let second = subject_hash("203.0.113.7", Some(b"second key"));
+        let first = subject_hash("203.0.113.7", Some(first_key.as_slice()));
+        let second = subject_hash("203.0.113.7", Some(second_key.as_slice()));
         assert_ne!(plain, first);
         assert_ne!(first, second);
-        assert_eq!(first, subject_hash("203.0.113.7", Some(b"first key")));
-        assert_ne!(first, subject_hash("203.0.113.8", Some(b"first key")));
+        assert_eq!(
+            first,
+            subject_hash("203.0.113.7", Some(first_key.as_slice()))
+        );
+        assert_ne!(
+            first,
+            subject_hash("203.0.113.8", Some(first_key.as_slice()))
+        );
         assert_eq!(first.len(), 64);
         // an empty key is treated as no key rather than a weak one
-        assert_eq!(subject_hash("203.0.113.7", Some(b"")), plain);
+        let empty: Vec<u8> = Vec::new();
+        assert_eq!(subject_hash("203.0.113.7", Some(empty.as_slice())), plain);
     }
 }
