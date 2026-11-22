@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100
         with:
           targets: ${{ matrix.target }}
 

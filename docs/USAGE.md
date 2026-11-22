@@ -4,7 +4,7 @@ This guide covers local development, service configuration, deployment, and comm
 
 ## Requirements
 
-- Rust 1.88, pinned by `rust-toolchain.toml`
+- Rust 1.100, pinned by `rust-toolchain.toml` (the declared minimum is 1.89, which the current `uuid` needs)
 - Docker and Docker Compose for the local multi-service stack
 - Redis for shared blocklist and request-frequency state
 - PostgreSQL for audit events, tarpit corpus reads, crawler credits, admin auth state, and training records

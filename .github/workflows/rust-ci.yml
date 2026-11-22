@@ -29,7 +29,7 @@ jobs:
           set -a
           . ./config/sample.env
           test "$ADMIN_UI_WEBAUTHN_RP_NAME" = "AI Scraping Defense Admin"
-      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100
         with:
           components: rustfmt, clippy
       - name: Check formatting
@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100
       - name: Install locked audit tool
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit resolved dependencies

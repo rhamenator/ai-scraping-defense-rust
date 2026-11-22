@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The Rust toolchain moves from 1.88 to 1.100 (`rust-toolchain.toml`, the Dockerfile and both workflows; declared minimum `rust-version` 1.89), and the `uuid` version cap is removed (`uuid = "1"`; the lock moves from 1.26.1 to 1.29.3). The cap existed only because uuid 1.27+ needs Rust 1.89, and `webauthn-rs` also needs `uuid::Uuid`, so the dependency could not simply be dropped. Dependency updates that need a newer compiler no longer have to be refused; the toolchain is now the one pinned thing, and it is meant to be moved forward regularly. Contributors who build locally need Rust 1.89 or newer (`rustup` picks 1.100 automatically from `rust-toolchain.toml`).
+
 ### Fixed
 
 - Several services pointed at one JSONL audit file could lose events. An erasure or retention pass rewrites the whole file, and the in-process lock only orders one service's own tasks, so events another service appended meanwhile were dropped (in a test, more than half of 300). All JSONL appends, erasures and purges now also hold an exclusive file lock on `<audit file>.lock`. PostgreSQL is still the better choice when more than one service writes events.
