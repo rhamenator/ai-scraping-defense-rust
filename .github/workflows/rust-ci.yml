@@ -13,6 +13,11 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Guard patched dependency versions
@@ -32,6 +37,8 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace
       - name: Test workspace
+        env:
+          TARPIT_TEST_REDIS_URL: redis://127.0.0.1:6379/
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
