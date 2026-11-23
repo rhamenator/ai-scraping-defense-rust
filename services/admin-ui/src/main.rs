@@ -1,4 +1,5 @@
 mod oidc;
+mod setup;
 mod webauthn;
 
 use asd_core::{
@@ -41,6 +42,7 @@ struct AppState {
     gdpr: asd_core::gdpr::GdprConfig,
     /// Optional secret for the subject hash (`GDPR_HASH_KEY`); see `asd_core::gdpr::subject_hash`.
     gdpr_hash_key: Option<Arc<Vec<u8>>>,
+    setup: setup::SetupStore,
 }
 
 const SESSION_COOKIE: &str = "asd_admin_session";
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         // A mistyped setting stops startup instead of silently changing what a deletion request does.
         gdpr: asd_core::gdpr::GdprConfig::from_env()?,
         gdpr_hash_key: asd_core::gdpr::hash_key_from_env().map(Arc::new),
+        setup: setup::new_setup_store(),
     };
     ensure_admin_auth_tables(state.pg.as_deref()).await?;
     // Retention is a deployment policy decision, so it is off unless AUDIT_RETENTION_DAYS is set above zero.
@@ -92,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { health("admin-ui").await }))
         .route("/", get(index))
         .route("/settings", get(settings))
+        .route("/setup", get(setup::get_setup).post(setup::post_setup))
         .route("/logs", get(logs))
         .route("/plugins", get(plugins).post(update_plugins))
         .route("/metrics", get(metrics_json))
@@ -1314,6 +1318,7 @@ mod browser_session_tests {
             passkeys: Arc::new(webauthn::PasskeyService::from_env().unwrap()),
             mfa_attempts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            setup: setup::new_setup_store(),
         }
     }
 
@@ -1331,6 +1336,7 @@ mod browser_session_tests {
     fn app(state: AppState) -> Router {
         Router::new()
             .route("/", get(index))
+            .route("/setup", get(setup::get_setup).post(setup::post_setup))
             .route("/session", get(get_session).post(create_session))
             .route("/blocklist", get(blocklist))
             .route("/block", post(block))
@@ -1994,5 +2000,58 @@ mod gdpr_erasure_tests {
             call_for_tests(&app, "GET", "/gdpr/compliance-report", &[], None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn setup_requires_auth_and_allows_admin_rerun() {
+        let audit = AuditStore::from_env(None).await.unwrap();
+        let state = crate::browser_session_tests::state_for_tests(
+            audit,
+            asd_core::gdpr::GdprConfig::default(),
+        )
+        .await;
+        let app = app_for_tests(state);
+        let (anon_status, _, _) = call_for_tests(&app, "GET", "/setup", &[], None).await;
+        assert_eq!(anon_status, StatusCode::UNAUTHORIZED);
+
+        let (get_status, _, initial) =
+            call_for_tests(&app, "GET", "/setup", &[("x-api-key", KEY)], None).await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(initial["completed"], false);
+
+        let (post_status, _, saved) = call_for_tests(
+            &app,
+            "POST",
+            "/setup",
+            &[("x-api-key", KEY)],
+            Some(json!({
+                "backend_url": "https://origin.example.com",
+                "model_uri": "mcp://primary/classify",
+                "captcha_provider": "builtin",
+                "cloudflare_enabled": true,
+                "enable_mcp_model": true,
+                "mark_complete": true
+            })),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::OK);
+        assert_eq!(saved["completed"], true);
+        assert_eq!(saved["backend_url"], "https://origin.example.com");
+
+        let (rerun_status, _, rerun) = call_for_tests(
+            &app,
+            "POST",
+            "/setup",
+            &[("x-api-key", KEY)],
+            Some(json!({
+                "backend_url": "https://origin2.example.com",
+                "enable_mcp_model": false,
+                "mark_complete": true
+            })),
+        )
+        .await;
+        assert_eq!(rerun_status, StatusCode::OK);
+        assert_eq!(rerun["backend_url"], "https://origin2.example.com");
+        assert_eq!(rerun["enable_mcp_model"], false);
     }
 }
