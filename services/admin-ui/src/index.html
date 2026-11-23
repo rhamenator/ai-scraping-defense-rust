@@ -5,28 +5,75 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Scraping Defense Admin</title>
   <style>
-    :root { color-scheme: light dark; font-family: Arial, sans-serif; }
-    body { margin: 0; background: #f7f8fa; color: #1f2933; }
-    header { background: #1f2933; color: white; padding: 18px 24px; display: flex; justify-content: space-between; align-items: center; }
-    main { max-width: 1040px; margin: 0 auto; padding: 24px; display: grid; gap: 18px; }
-    section { background: white; border: 1px solid #dde3ea; border-radius: 6px; padding: 18px; }
-    h1, h2 { margin: 0 0 12px; }
+    :root {
+      --paper: #f4efe4;
+      --paper-deep: #e8dcc4;
+      --ink: #1d2218;
+      --muted: #5f6658;
+      --line: rgba(29, 34, 24, 0.14);
+      --accent: #8d2a1e;
+      --accent-soft: rgba(141, 42, 30, 0.12);
+      --ok: #355e3b;
+      --panel: rgba(255, 252, 245, 0.9);
+      --panel-strong: rgba(255, 255, 255, 0.86);
+      --shadow: 0 24px 60px rgba(33, 26, 17, 0.14);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(141, 42, 30, 0.16), transparent 34%),
+        radial-gradient(circle at top right, rgba(53, 94, 59, 0.14), transparent 30%),
+        linear-gradient(180deg, #f8f4eb 0%, #ece0c9 100%);
+      font-family: "Avenir Next", "Segoe UI", system-ui, -apple-system, sans-serif;
+      line-height: 1.55;
+    }
+    header {
+      max-width: 1100px;
+      margin: 24px auto 0;
+      padding: 18px 28px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    main { max-width: 1100px; margin: 0 auto; padding: 20px 0 48px; display: grid; gap: 18px; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 24px 28px;
+      box-shadow: var(--shadow);
+    }
+    h1, h2 {
+      margin: 0 0 12px;
+      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      color: var(--ink);
+      letter-spacing: -0.02em;
+    }
     header h1 { margin: 0; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-    .metric { background: #edf2f7; border-radius: 6px; padding: 12px; text-align: center; }
-    .metric strong { display: block; font-size: 1.8em; }
-    a { color: #0f766e; font-weight: 600; }
-    code { background: #edf2f7; padding: 2px 5px; border-radius: 4px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #dde3ea; vertical-align: top; }
+    a { color: var(--accent); font-weight: 600; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: rgba(29, 34, 24, 0.07); padding: 2px 6px; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel-strong); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+    th, td { text-align: left; padding: 9px 12px; border: 1px solid var(--line); vertical-align: top; }
+    thead th { background: rgba(29, 34, 24, 0.06); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .metrics-sheet thead th:last-child, .metric-value-cell { text-align: right; }
+    .metric-value-cell { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; color: var(--accent); }
     #events-table td:last-child { overflow-wrap: anywhere; }
-    label { display: block; margin-top: 8px; }
-    input { padding: 6px; margin: 4px 0 10px; width: 100%; max-width: 420px; box-sizing: border-box; background: #fff; color: #1f2933; border: 1px solid #9aa5b1; border-radius: 4px; }
-    button { padding: 6px 12px; margin-right: 6px; cursor: pointer; background: #edf2f7; color: #1f2933; border: 1px solid #9aa5b1; border-radius: 4px; }
-    dialog { background: #fff; color: #1f2933; }
-    #error { color: #8a1c1c; font-weight: bold; }
+    label { display: block; margin-top: 8px; font-weight: 600; font-size: 0.88rem; }
+    input { padding: 8px 12px; margin: 4px 0 10px; width: 100%; max-width: 420px; box-sizing: border-box; background: rgba(255,255,255,0.9); color: var(--ink); border: 1px solid var(--line); border-radius: 12px; }
+    button { padding: 8px 16px; margin-right: 6px; cursor: pointer; background: var(--accent); color: #fffaf2; border: 1px solid transparent; border-radius: 999px; font-weight: 600; }
+    button[value="cancel"], #sign-out { background: rgba(29, 34, 24, 0.08); color: var(--ink); border-color: var(--line); }
+    dialog { background: var(--paper); color: var(--ink); border: 1px solid var(--line); max-width: 420px; border-radius: 20px; box-shadow: var(--shadow); }
+    #error { color: var(--accent); font-weight: bold; }
     [hidden] { display: none !important; }
-    dialog { max-width: 420px; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -49,23 +96,6 @@
 
     <div id="dashboard" hidden>
       <section>
-        <h2>Status</h2>
-        <div class="grid">
-          <div class="metric"><strong id="metric-blocked">-</strong>Blocked addresses</div>
-          <div class="metric"><strong id="metric-flagged">-</strong>Flagged addresses</div>
-        </div>
-        <p id="last-updated" role="status">Not loaded yet.</p>
-      </section>
-
-      <section>
-        <h2>Recent security events</h2>
-        <table id="events-table">
-          <thead><tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Actor</th><th scope="col">Details</th></tr></thead>
-          <tbody id="events-body"></tbody>
-        </table>
-      </section>
-
-      <section>
         <h2>Blocklist</h2>
         <label for="blocklist-search">Search addresses</label>
         <input id="blocklist-search" type="search" autocomplete="off">
@@ -82,6 +112,28 @@
           <input id="block-reason" required maxlength="200">
           <button type="submit">Block address</button>
         </form>
+      </section>
+
+      <section>
+        <h2>Status</h2>
+        <table class="metrics-sheet" aria-label="Status metrics">
+          <thead>
+            <tr><th scope="col">Metric</th><th scope="col">Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Blocked addresses</td><td id="metric-blocked" class="metric-value-cell">-</td></tr>
+            <tr><td>Flagged addresses</td><td id="metric-flagged" class="metric-value-cell">-</td></tr>
+          </tbody>
+        </table>
+        <p id="last-updated" role="status">Not loaded yet.</p>
+      </section>
+
+      <section>
+        <h2>Recent security events</h2>
+        <table id="events-table">
+          <thead><tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Actor</th><th scope="col">Details</th></tr></thead>
+          <tbody id="events-body"></tbody>
+        </table>
       </section>
     </div>
 
