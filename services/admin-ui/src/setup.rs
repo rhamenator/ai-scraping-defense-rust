@@ -7,13 +7,14 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 pub type SetupStore = Arc<Mutex<SetupState>>;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupState {
     pub completed: bool,
     pub backend_url: String,
@@ -22,10 +23,15 @@ pub struct SetupState {
     pub cloudflare_enabled: bool,
     pub enable_mcp_model: bool,
     pub updated_at: Option<String>,
+    pub persistence: String,
 }
 
 impl SetupState {
     pub fn from_env() -> Self {
+        let state_path = setup_state_path();
+        if let Some(loaded) = load_from_file(&state_path) {
+            return loaded;
+        }
         Self {
             completed: env_string("ADMIN_UI_SKIP_SETUP_WIZARD", "false")
                 .eq_ignore_ascii_case("true"),
@@ -34,11 +40,53 @@ impl SetupState {
             captcha_provider: env_string("CAPTCHA_PROVIDER", "builtin"),
             cloudflare_enabled: env_string("CLOUDFLARE_ENABLED", "false")
                 .eq_ignore_ascii_case("true"),
-            enable_mcp_model: env_string("ENABLE_MCP_MODEL", "false")
-                .eq_ignore_ascii_case("true"),
+            enable_mcp_model: env_string("ENABLE_MCP_MODEL", "false").eq_ignore_ascii_case("true"),
             updated_at: None,
+            persistence: "env".to_string(),
         }
     }
+}
+
+fn setup_state_path() -> PathBuf {
+    PathBuf::from(env_string("SETUP_STATE_PATH", "data/setup-state.json"))
+}
+
+fn load_from_file(path: &PathBuf) -> Option<SetupState> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<SetupState>(&raw).ok()
+}
+
+fn save_to_file(path: &PathBuf, state: &SetupState) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+async fn save_to_pg(pg: &tokio_postgres::Client, state: &SetupState) -> Result<(), String> {
+    pg.batch_execute(
+        "CREATE TABLE IF NOT EXISTS admin_ui_setup_state (
+            id SMALLINT PRIMARY KEY DEFAULT 1,
+            payload JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let payload = serde_json::to_value(state).map_err(|e| e.to_string())?;
+    pg.execute(
+        "INSERT INTO admin_ui_setup_state (id, payload, updated_at)
+         VALUES (1, $1, NOW())
+         ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()",
+        &[&payload],
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn new_setup_store() -> SetupStore {
@@ -86,8 +134,17 @@ fn validate_captcha_provider(raw: &str) -> Result<String, &'static str> {
 fn render_setup_html(state: &SetupState) -> String {
     let backend = html_escape(&state.backend_url);
     let model = html_escape(&state.model_uri);
-    let cf_selected = if state.cloudflare_enabled { "checked" } else { "" };
-    let mcp_selected = if state.enable_mcp_model { "checked" } else { "" };
+    let provider = html_escape(&state.captcha_provider);
+    let cf_selected = if state.cloudflare_enabled {
+        "checked"
+    } else {
+        ""
+    };
+    let mcp_selected = if state.enable_mcp_model {
+        "checked"
+    } else {
+        ""
+    };
     let status_text = if state.completed {
         "Completed (authenticated admins can re-run setup anytime)"
     } else {
@@ -134,10 +191,14 @@ a {{ color: #93c5fd; }}
 document.getElementById('captcha_provider').value = '{provider}';
 document.getElementById('setup-form').addEventListener('submit', async (ev) => {{
   ev.preventDefault();
+  const sessRes = await fetch('/session', {{ credentials: 'same-origin' }});
+  const sess = sessRes.ok ? await sessRes.json() : {{}};
+  const headers = {{ 'Content-Type': 'application/json' }};
+  if (sess.csrf_token) headers['X-CSRF-Token'] = sess.csrf_token;
   const res = await fetch('/setup', {{
     method: 'POST',
     credentials: 'same-origin',
-    headers: {{ 'Content-Type': 'application/json' }},
+    headers,
     body: JSON.stringify({{
       backend_url: document.getElementById('backend_url').value,
       model_uri: document.getElementById('model_uri').value,
@@ -147,13 +208,14 @@ document.getElementById('setup-form').addEventListener('submit', async (ev) => {
       mark_complete: document.getElementById('mark_complete').checked
     }})
   }});
-  document.getElementById('setup-status').textContent = res.ok ? 'Setup saved.' : 'Failed to save setup.';
+  document.getElementById('setup-status').textContent = res.ok
+    ? 'Setup saved durably. Restart dependent services if core environment URLs changed.'
+    : 'Failed to save setup.';
 }});
 </script>
 </div>
 </body>
-</html>"#,
-        provider = html_escape(&state.captcha_provider),
+</html>"#
     )
 }
 
@@ -179,49 +241,68 @@ pub async fn post_setup(
     _auth: Extension<AuthVia>,
     Json(payload): Json<SetupUpdateRequest>,
 ) -> Response {
-    let mut guard = state.setup.lock().await;
+    let mut candidate = state.setup.lock().await.clone();
     if let Some(raw_url) = payload.backend_url.as_deref() {
         match validate_backend_url(raw_url) {
-            Ok(clean) => guard.backend_url = clean,
+            Ok(clean) => candidate.backend_url = clean,
             Err(msg) => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
                     .into_response()
             }
         }
     }
     if let Some(model_uri) = payload.model_uri {
-        guard.model_uri = model_uri.trim().to_string();
+        candidate.model_uri = model_uri.trim().to_string();
     }
     if let Some(raw_provider) = payload.captcha_provider.as_deref() {
         match validate_captcha_provider(raw_provider) {
-            Ok(clean) => guard.captcha_provider = clean,
+            Ok(clean) => candidate.captcha_provider = clean,
             Err(msg) => {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
                     .into_response()
             }
         }
     }
     if let Some(cf) = payload.cloudflare_enabled {
-        guard.cloudflare_enabled = cf;
+        candidate.cloudflare_enabled = cf;
     }
     if let Some(mcp) = payload.enable_mcp_model {
-        guard.enable_mcp_model = mcp;
+        candidate.enable_mcp_model = mcp;
     }
-    guard.completed = payload.mark_complete.unwrap_or(true);
+    candidate.completed = payload.mark_complete.unwrap_or(true);
     let epoch_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    guard.updated_at = Some(epoch_secs.to_string());
-    let updated = guard.clone();
-    drop(guard);
+    candidate.updated_at = Some(epoch_secs.to_string());
+
+    if let Some(pg) = state.pg.as_deref() {
+        if let Err(err) = save_to_pg(pg, &candidate).await {
+            tracing::error!(error = %err, "failed to persist setup state in postgres");
+        } else {
+            candidate.persistence = "postgres".to_string();
+        }
+    }
+    if let Err(err) = save_to_file(&setup_state_path(), &candidate) {
+        tracing::warn!(error = %err, "failed to persist setup state file");
+    } else if candidate.persistence == "env" {
+        candidate.persistence = "file".to_string();
+    }
+
+    *state.setup.lock().await = candidate.clone();
 
     let _ = asd_core::record_security_event(
         &state.audit,
         "admin-ui",
         "setup_wizard_updated",
-        serde_json::json!({ "completed": updated.completed }),
+        serde_json::json!({ "completed": candidate.completed }),
     )
     .await;
-    Json(updated).into_response()
+    Json(candidate).into_response()
 }

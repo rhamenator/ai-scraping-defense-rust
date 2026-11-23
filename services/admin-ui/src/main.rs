@@ -1085,6 +1085,7 @@ fn session_may_access(method: &Method, path: &str) -> bool {
         Method::GET | Method::HEAD => matches!(
             path,
             "/settings"
+                | "/setup"
                 | "/logs"
                 | "/metrics"
                 | "/block_stats"
@@ -1092,7 +1093,7 @@ fn session_may_access(method: &Method, path: &str) -> bool {
                 | "/plugins"
                 | "/mfa/backup-codes/remaining"
         ),
-        Method::POST => matches!(path, "/block" | "/unblock" | "/logout"),
+        Method::POST => matches!(path, "/block" | "/unblock" | "/logout" | "/setup"),
         _ => false,
     }
 }
@@ -1602,6 +1603,8 @@ mod browser_session_tests {
             assert!(session_may_access(&Method::GET, path), "GET {path}");
             assert!(!session_may_access(&Method::POST, path), "POST {path}");
         }
+        assert!(session_may_access(&Method::GET, "/setup"), "GET /setup");
+        assert!(session_may_access(&Method::POST, "/setup"), "POST /setup");
         for path in ["/block", "/unblock", "/logout"] {
             assert!(session_may_access(&Method::POST, path), "POST {path}");
             assert!(!session_may_access(&Method::GET, path), "GET {path}");
