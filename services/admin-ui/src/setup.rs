@@ -64,7 +64,13 @@ fn save_to_file(path: &PathBuf, state: &SetupState) -> Result<(), std::io::Error
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    std::fs::write(path, json)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 async fn save_to_pg(pg: &tokio_postgres::Client, state: &SetupState) -> Result<(), String> {
@@ -116,9 +122,15 @@ fn validate_backend_url(raw: &str) -> Result<String, &'static str> {
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    let valid_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
-    if !valid_scheme || trimmed.contains(char::is_whitespace) {
-        return Err("backend_url must be a valid http or https URL");
+    let parsed = reqwest::Url::parse(trimmed).map_err(|_| "backend_url must be a valid URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("backend_url must use http or https");
+    }
+    if parsed.host_str().is_none_or(|h| h.is_empty())
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("backend_url must include a valid host without userinfo");
     }
     Ok(trimmed.to_string())
 }

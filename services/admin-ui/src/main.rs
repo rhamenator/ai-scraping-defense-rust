@@ -2013,6 +2013,10 @@ mod gdpr_erasure_tests {
             asd_core::gdpr::GdprConfig::default(),
         )
         .await;
+        {
+            let mut guard = state.setup.lock().await;
+            guard.completed = false;
+        }
         let app = app_for_tests(state);
         let (anon_status, _, _) = call_for_tests(&app, "GET", "/setup", &[], None).await;
         assert_eq!(anon_status, StatusCode::UNAUTHORIZED);
@@ -2056,5 +2060,17 @@ mod gdpr_erasure_tests {
         assert_eq!(rerun_status, StatusCode::OK);
         assert_eq!(rerun["backend_url"], "https://origin2.example.com");
         assert_eq!(rerun["enable_mcp_model"], false);
+
+        for bad_url in ["http://", "http://@"] {
+            let (bad_status, _, _) = call_for_tests(
+                &app,
+                "POST",
+                "/setup",
+                &[("x-api-key", KEY)],
+                Some(json!({ "backend_url": bad_url })),
+            )
+            .await;
+            assert_eq!(bad_status, StatusCode::BAD_REQUEST, "url={bad_url}");
+        }
     }
 }

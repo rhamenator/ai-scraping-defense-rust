@@ -149,7 +149,7 @@ services:
       JWT_ISSUER: "${JWT_ISSUER:-}"
       JWT_AUDIENCE: "${JWT_AUDIENCE:-}"
     ports:
-      - "8004:8004"
+      - "127.0.0.1:${ADMIN_UI_PORT:-8004}:8004"
 
   captcha-service:
     build: .
