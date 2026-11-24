@@ -8,6 +8,13 @@ AI Scraping Defense Rust is a defensive service stack for detecting, throttling,
 
 The project is designed for operators who need a fast, explicit, service-based control plane around bot detection and response. It can run locally with Cargo, as a Docker Compose stack, or as Kubernetes/Helm workloads.
 
+## What's New Since v0.1.9
+
+- **Authenticated `/setup` Wizard & Security Hardening (`#94`, `#95`):** Added an authenticated `/setup` wizard to `admin-ui`, bound the Compose `admin-ui` port to `127.0.0.1`, enforced strict URL host validation, and wrote the setup state file with `0600` permissions.
+- **Browser Admin Console & Warm-Paper UI (`#87`, `#93`):** Added browser sign-in, live status, security events, and blocklist management with CSRF protection, styled to match the IIS Admin UI.
+- **GDPR Erasure & Audit Locking (`#89`, `#90`, `#91`):** Added configurable GDPR erasure (redact, delete, or manual handling), cross-process locking for the shared JSONL audit file, and `docs/PRIVACY.md`.
+- **Toolchain & Dependency Security (`#80`, `#86`, `#88`, `#92`):** Upgraded to Rust `1.100`, updated `url` to `2.5.9` (`RUSTSEC-2026-0592`), and returned `501 Not Implemented` for unimplemented admin operations instead of claiming success.
+
 ## Scope
 
 Implemented baseline services:
