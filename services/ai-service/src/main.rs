@@ -81,7 +81,7 @@ async fn webhook(
             if !state.blocklist.block(ip.to_string()).await {
                 return Err(error(
                     StatusCode::BAD_REQUEST,
-                    "IP is invalid or belongs to trusted proxy infrastructure",
+                    "IP is invalid, is a loopback or unspecified address, or belongs to trusted proxy infrastructure",
                 ));
             }
             record_security_event(

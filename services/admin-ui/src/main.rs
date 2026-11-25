@@ -325,7 +325,7 @@ async fn block(
             .await
         {
             return Err(bad_request(
-                "IP is invalid or belongs to trusted proxy infrastructure",
+                "IP is invalid, is a loopback or unspecified address, or belongs to trusted proxy infrastructure",
             ));
         }
         record_security_event(

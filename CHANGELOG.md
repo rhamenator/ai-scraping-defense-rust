@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Loopback and unspecified addresses can no longer be blocked (#97). `POST /block` (admin), the signed webhook, the tarpit hop limit, the engine and edge-ops all share one check, which now refuses `127.0.0.0/8`, `::1`, `0.0.0.0` and `::` (including their IPv4-mapped forms) with the existing 400 response, matching the Python edition (#2003). Such an address can never be a real client behind the proxy, so a typo or script could only have blocked local traffic. Private ranges (`10/8`, `172.16/12`, `192.168/16`) remain blockable because internal networks and VPNs are legitimate sources, and trusted proxy ranges keep their separate protection. The error text now names loopback and unspecified addresses.
+
 - Several services pointed at one JSONL audit file could lose events. An erasure or retention pass rewrites the whole file, and the in-process lock only orders one service's own tasks, so events another service appended meanwhile were dropped (in a test, more than half of 300). All JSONL appends, erasures and purges now also hold an exclusive file lock on `<audit file>.lock`. PostgreSQL is still the better choice when more than one service writes events.
 
 ### Added
