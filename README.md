@@ -8,6 +8,10 @@ AI Scraping Defense Rust is a defensive service stack for detecting, throttling,
 
 The project is designed for operators who need a fast, explicit, service-based control plane around bot detection and response. It can run locally with Cargo, as a Docker Compose stack, or as Kubernetes/Helm workloads.
 
+## What's New Since v0.1.10
+
+- **Loopback and unspecified addresses can no longer be blocked (`#97`, `#98`):** `POST /block`, the signed webhook, the tarpit hop limit, the engine and edge-ops now share one check that refuses `127.0.0.0/8`, `::1`, `0.0.0.0` and `::` (including IPv4-mapped forms) with the existing 400 response, matching the Python and .NET editions. Private ranges (`10/8`, `172.16/12`, `192.168/16`) remain blockable.
+
 ## What's New Since v0.1.9
 
 - **Authenticated `/setup` Wizard & Security Hardening (`#94`, `#95`):** Added an authenticated `/setup` wizard to `admin-ui`, bound the Compose `admin-ui` port to `127.0.0.1`, enforced strict URL host validation, and wrote the setup state file with `0600` permissions.
