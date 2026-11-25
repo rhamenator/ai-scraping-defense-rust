@@ -5,3 +5,4 @@ artifacts/
 /logs/
 *.profraw
 __pycache__/
+services/admin-ui/data/

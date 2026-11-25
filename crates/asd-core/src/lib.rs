@@ -1194,6 +1194,12 @@ pub fn is_blockable_client_ip(candidate: &str) -> bool {
     let ip = normalized
         .parse::<std::net::IpAddr>()
         .expect("normalized IP");
+    // Loopback and the unspecified address can never be a real client behind the proxy (IPv4-mapped forms
+    // were already reduced to IPv4 above). Private ranges stay blockable: internal networks and VPNs are
+    // legitimate sources, and trusted proxy ranges are protected separately below.
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
     !ip_in_configured_ranges(
         ip,
         &[
@@ -1826,6 +1832,28 @@ pub struct IpAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn loopback_and_unspecified_addresses_are_never_blocked() {
+        let state = BlocklistState::default();
+        for ip in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "0.0.0.0",
+            "::",
+            "::ffff:127.0.0.1",
+            "::ffff:0.0.0.0",
+        ] {
+            assert!(!state.block(ip).await, "{ip} must be refused");
+        }
+        assert!(state.blocked().await.is_empty());
+        // private and documentation ranges remain blockable
+        assert!(state.block("10.0.0.5").await);
+        assert!(state.block("192.168.1.9").await);
+        assert!(state.block("203.0.113.7").await);
+        assert_eq!(state.blocked().await.len(), 3);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_services_sharing_one_jsonl_file_never_lose_each_others_events() {
